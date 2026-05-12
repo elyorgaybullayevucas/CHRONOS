@@ -1,7 +1,4 @@
 # config.py
-"""
-CHRONOS — konfiguratsiya sinfi.
-"""
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -9,45 +6,30 @@ from typing import List, Optional
 @dataclass
 class Config:
     # ── Dataset ───────────────────────────────────────────────────────────────
-    dataset:      str = "ICEWS18"
-    data_dir:     str = "data"
+    dataset:       str = "ICEWS18"
+    data_dir:      str = "data"
     num_entities:  int = 0
     num_relations: int = 0
     num_times:     int = 0
 
-    # ── Model o'lchamlari ─────────────────────────────────────────────────────
-    entity_dim:   int = 256
-    relation_dim: int = 256
-    hidden_dim:   int = 512
-    delta_dim:    int = 64     # Δt encoding dimension
-    tfe_dim:      int = 32     # TFE output dimension
-    trtm_dim:     int = 64     # TRTM internal dimension
-    num_heads:    int = 8
-    num_layers:   int = 2
-    ffn_dim:      int = 1024
+    # ── Model ─────────────────────────────────────────────────────────────────
+    entity_dim:   int   = 256
+    relation_dim: int   = 256
+    hidden_dim:   int   = 512
+    delta_dim:    int   = 64
     dropout:      float = 0.1
 
-    # ── TPL (Temporal Pattern Library) ────────────────────────────────────────
-    num_patterns: int = 128    # K — pattern soni
-
-    # ── TRTM (Temporal Relation Transition Memory) ────────────────────────────
-    num_trtm_bins: int = 32    # Δt diskretizatsiya bin soni
-
     # ── Path sampling ─────────────────────────────────────────────────────────
-    num_paths:    int = 8
+    num_paths:    int = 6
     max_path_len: int = 3
-
-    # ── Negative sampling ─────────────────────────────────────────────────────
     num_negative: int = 256
 
-    # ── Tarix (history) ───────────────────────────────────────────────────────
-    use_history:  bool = True
-    max_history:  int  = 64
-
-    # ── Reciprocal triples ────────────────────────────────────────────────────
+    # ── History ───────────────────────────────────────────────────────────────
+    use_history:    bool = True
+    max_history:    int  = 32
     use_reciprocal: bool = True
 
-    # ── O'qitish ──────────────────────────────────────────────────────────────
+    # ── Training ──────────────────────────────────────────────────────────────
     num_epochs:      int   = 50
     batch_size:      int   = 512
     learning_rate:   float = 3e-4
@@ -55,11 +37,11 @@ class Config:
     grad_clip:       float = 1.0
     label_smoothing: float = 0.1
 
-    # ── Yo'qotish og'irliklari ─────────────────────────────────────────────────
+    # ── Loss weights ──────────────────────────────────────────────────────────
     w_link:      float = 1.0
     w_self_adv:  float = 0.5
-    w_pcl:       float = 0.1   # Path Contrastive Learning
-    w_ortho_reg: float = 0.001
+    w_pcl:       float = 0.0   # disabled
+    w_ortho_reg: float = 0.0   # disabled
 
     # ── Runtime ───────────────────────────────────────────────────────────────
     device:      str  = "cuda"
@@ -73,8 +55,19 @@ class Config:
     filter_flag: bool = True
     hits_at_k:   List[int] = field(default_factory=lambda: [1, 3, 10])
 
+    # backward compat
+    num_heads:     int   = 8
+    num_layers:    int   = 2
+    ffn_dim:       int   = 1024
+    num_patterns:  int   = 128
+    num_trtm_bins: int   = 32
+    tfe_dim:       int   = 32
+    trtm_dim:      int   = 64
+    w_direct:      float = 0.0
+    w_pattern_div: float = 0.0
+    w_contrastive: float = 0.0
 
-# ── Dataset statistikalari ────────────────────────────────────────────────────
+
 DATASET_STATS = {
     "ICEWS14": {"num_entities": 7128,  "num_relations": 230,  "num_times": 365},
     "ICEWS18": {"num_entities": 23033, "num_relations": 256,  "num_times": 304},
