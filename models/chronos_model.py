@@ -972,6 +972,9 @@ class CHRONOSModel(nn.Module):
             ).squeeze(-1)                                        # (B, E)
             scores  = scores + self.w_direct * direct
 
+        # FP16 overflow oldini olish: scorlarni clamp qilamiz
+        scores = scores.clamp(-20, 20)
+
         # ── 7. Link Prediction Loss (NSS + label smoothing) ──────────────────
         # Pozitiv ob'ekt + N ta negatif
         pos_score = scores[torch.arange(B), objects]            # (B,)
@@ -1066,5 +1069,7 @@ class CHRONOSModel(nn.Module):
                 torch.cat([q_exp, o_exp, r_exp], dim=-1)
             ).squeeze(-1)
             scores = scores + self.w_direct * direct
+
+        scores = scores.clamp(-20, 20)
 
         return scores
