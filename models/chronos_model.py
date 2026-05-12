@@ -423,7 +423,7 @@ class CHRONOSModel(nn.Module):
             t_n     = t_val.float() / float(self.num_times)
             t_exp   = t_n.unsqueeze(0).expand(E)            # (E,) same value
             ent_emb = self.de_emb(all_ids, t_exp).float()  # (E, D) f32
-            scores[mask] = q32[mask] @ ent_emb.T           # (b_i, E)
+            scores[mask] = (q32[mask] @ ent_emb.T).float()  # (b_i, E) — force f32
 
         return scores.clamp(-10, 10)
 
