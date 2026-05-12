@@ -161,14 +161,17 @@ class CHRONOSDataModule:
             max_path_len  = cfg.max_path_len,
             max_history   = cfg.max_history if cfg.use_history else 0,
         )
+        nw = cfg.num_workers
         return DataLoader(
             ds,
-            batch_size  = cfg.batch_size,
-            shuffle     = shuffle,
-            num_workers = cfg.num_workers,
-            collate_fn  = fn,
-            pin_memory  = True,
-            drop_last   = shuffle,
+            batch_size         = cfg.batch_size,
+            shuffle            = shuffle,
+            num_workers        = nw,
+            collate_fn         = fn,
+            pin_memory         = True,
+            drop_last          = shuffle,
+            persistent_workers = (nw > 0),   # Worker jarayonlarini qayta ishlatish
+            prefetch_factor    = 2 if nw > 0 else None,
         )
 
     def train_loader(self) -> DataLoader:

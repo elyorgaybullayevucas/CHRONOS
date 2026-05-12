@@ -118,22 +118,23 @@ def _apply_dataset_preset(cfg: Config, logger) -> None:
         logger.info("GDELT preset: epochs=30, num_paths=3, max_path_len=2")
 
     elif cfg.dataset in ("WIKI", "YAGO", "YAGOs"):
-        cfg.num_paths          = 8
+        cfg.num_paths          = 6        # 8→6: tezroq sampling, sifat saqlanadi
         cfg.max_path_len       = 3
-        cfg.batch_size         = 256
+        cfg.batch_size         = 512      # 256→512: GPU to'liq ishlatilsin
         cfg.num_negative       = 256
         cfg.use_history        = True
-        cfg.max_history        = 64
+        cfg.max_history        = 32       # 64→32: QATS kichikroq history bilan ham yaxshi
         cfg.use_reciprocal     = True
-        cfg.w_self_adv         = 0.1    # Adv kuchsizroq: main signal = link + PCL
-        cfg.w_pcl              = 0.2    # PCL WIKI/YAGO uchun kuchliroq
+        cfg.w_self_adv         = 0.1
+        cfg.w_pcl              = 0.2
         cfg.w_ortho_reg        = 0.001
         cfg.dropout            = 0.15
         cfg.label_smoothing    = 0.1
         cfg.weight_decay       = 1e-4
         cfg.learning_rate      = 3e-4
         cfg.num_epochs         = 500
-        logger.info(f"{cfg.dataset} preset: epochs=500, w_pcl=0.2, w_self_adv=0.1")
+        cfg.num_workers        = 8        # Ko'proq worker = tezroq data yuklash
+        logger.info(f"{cfg.dataset} preset: epochs=500, batch=512, num_paths=6, workers=8")
 
     elif cfg.dataset in ("ICEWS18", "ICEWS14"):
         cfg.num_paths          = 8

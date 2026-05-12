@@ -65,7 +65,7 @@ class Config:
     device:      str  = "cuda"
     fp16:        bool = True
     seed:        int  = 42
-    num_workers: int  = 4
+    num_workers: int  = 8
     save_dir:    str  = "checkpoints"
     log_dir:     str  = "logs"
     resume:      Optional[str] = None
