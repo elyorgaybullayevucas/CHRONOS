@@ -106,9 +106,9 @@ def _preset(cfg: Config, logger) -> None:
         cfg.dropout        = 0.1
         cfg.label_smoothing= 0.1
         cfg.learning_rate  = 3e-4
-        cfg.num_epochs     = 500
+        cfg.num_epochs     = 500 if cfg.dataset in ("YAGO", "YAGOs") else 150
         cfg.num_workers    = 8
-        logger.info(f"{cfg.dataset}: epochs=500, batch=512, history=32")
+        logger.info(f"{cfg.dataset}: epochs={cfg.num_epochs}, batch=512, history=32")
 
     elif cfg.dataset in ("ICEWS18", "ICEWS14"):
         cfg.num_paths      = 6
