@@ -460,6 +460,38 @@ class CHRONOSModel(nn.Module):
         query = self.query_mlp(cat_in)                          # (B, D)
         return query, distmult
 
+    # ── Vaqtiy barcha entity score ────────────────────────────────────────────
+
+    def _score_all(
+        self, query: torch.Tensor, times: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        score[b, e] = query[b] · e_{t_b}(e)
+
+        Har unique vaqt uchun (E, D) DE embedding bir marta hisoblanadi —
+        B×E×D kengaytirish yo'q. Faqat max(unique_t) × E×D xotira.
+
+        Bu DE-SimplE kabi ikki tomonlama vaqtiy scoring beradi:
+          subject: e_t(s) via _build_query
+          object:  e_t(o) via _score_all
+        """
+        B, D    = query.shape
+        E       = self.num_entities
+        device  = query.device
+
+        unique_t, t_inv = torch.unique(times, return_inverse=True)
+        all_ids = torch.arange(E, device=device)
+        scores  = torch.zeros(B, E, device=device, dtype=query.dtype)
+
+        for i, t_val in enumerate(unique_t):
+            mask    = (t_inv == i)                               # (B,) bool
+            t_n     = t_val.float() / float(self.num_times)
+            t_exp   = t_n.unsqueeze(0).expand(E)                # (E,)
+            ent_emb = self.de_emb(all_ids, t_exp)               # (E, D)
+            scores[mask] = query[mask] @ ent_emb.T              # (b_i, E)
+
+        return scores.clamp(-10, 10)
+
     # ── Forward (training) ────────────────────────────────────────────────────
 
     def forward(
@@ -477,23 +509,28 @@ class CHRONOSModel(nn.Module):
 
         B         = subjects.size(0)
         rel_fixed = self._fix_rel(relations)
+        t_norm    = self._t_norm(times)
 
         query, _ = self._build_query(
             subjects, rel_fixed, times, paths, path_masks, history, hist_mask
         )
 
-        # Scoring: query · ent_emb.T
-        # Static embeddings for all entities — efficient, no B×E×D expansion.
-        # Temporal context is encoded in query via DE + TRE.
-        all_ent = self.de_emb.emb.weight                       # (E, D)
-        scores  = (query @ all_ent.T).clamp(-10, 10)           # (B, E)
+        # ── Vaqtiy pos/neg scoring (DE ham object uchun) ──────────────────────
+        pos_emb   = self.de_emb(objects, t_norm)                # (B, D)
+        pos_score = (query * pos_emb).sum(-1)                   # (B,)
+
+        has_neg = neg_objects.size(1) > 0
+        if has_neg:
+            N        = neg_objects.size(1)
+            t_exp    = t_norm.unsqueeze(1).expand(B, N).reshape(-1)   # (B*N,)
+            neg_emb  = self.de_emb(neg_objects.reshape(-1), t_exp)    # (B*N, D)
+            neg_score = (
+                query.unsqueeze(1) * neg_emb.view(B, N, -1)
+            ).sum(-1)                                           # (B, N)
+        else:
+            neg_score = query.new_zeros(B, 1)
 
         # ── Link loss (label smoothing) ───────────────────────────────────────
-        pos_score = scores[torch.arange(B), objects]           # (B,)
-        has_neg   = neg_objects.size(1) > 0
-        neg_score = scores.gather(1, neg_objects) if has_neg \
-                    else scores.new_zeros(B, 1)
-
         sm = self.label_smoothing
         def bce_ls(logit: torch.Tensor, label: float) -> torch.Tensor:
             t = torch.full_like(logit, label * (1 - sm) + sm * 0.5)
@@ -510,15 +547,15 @@ class CHRONOSModel(nn.Module):
                 )
             sa_loss = -(adv_w * F.logsigmoid(-neg_score)).sum(1).mean()
         else:
-            sa_loss = scores.new_tensor(0.0)
+            sa_loss = query.new_tensor(0.0)
 
         losses = {
             "link":      link_loss,
             "self_adv":  sa_loss,
-            "pcl":       scores.new_tensor(0.0),
-            "ortho_reg": scores.new_tensor(0.0),
+            "pcl":       query.new_tensor(0.0),
+            "ortho_reg": query.new_tensor(0.0),
         }
-        return scores, losses
+        return pos_score, losses
 
     # ── Predict (evaluation) ──────────────────────────────────────────────────
 
@@ -537,4 +574,4 @@ class CHRONOSModel(nn.Module):
         query, _  = self._build_query(
             subjects, rel_fixed, times, paths, path_masks, history, hist_mask
         )
-        return (query @ self.de_emb.emb.weight.T).clamp(-10, 10)
+        return self._score_all(query, times)
