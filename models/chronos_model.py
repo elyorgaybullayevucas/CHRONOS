@@ -396,7 +396,7 @@ class CHRONOSModel(nn.Module):
         )
 
         # ── 6. Self-adversarial temperature ───────────────────────────────────
-        self.rel_temp = nn.Embedding(self.total_relations * 2, 1)
+        self.rel_temp = nn.Embedding(self.total_relations, 1)
         nn.init.constant_(self.rel_temp.weight, 1.0)
 
     # ── Yordamchi ─────────────────────────────────────────────────────────────
@@ -483,6 +483,8 @@ class CHRONOSModel(nn.Module):
         )
 
         # Scoring: query · ent_emb.T
+        # Static embeddings for all entities — efficient, no B×E×D expansion.
+        # Temporal context is encoded in query via DE + TRE.
         all_ent = self.de_emb.emb.weight                       # (E, D)
         scores  = (query @ all_ent.T).clamp(-10, 10)           # (B, E)
 
@@ -535,5 +537,4 @@ class CHRONOSModel(nn.Module):
         query, _  = self._build_query(
             subjects, rel_fixed, times, paths, path_masks, history, hist_mask
         )
-        all_ent = self.de_emb.emb.weight
-        return (query @ all_ent.T).clamp(-10, 10)
+        return (query @ self.de_emb.emb.weight.T).clamp(-10, 10)
