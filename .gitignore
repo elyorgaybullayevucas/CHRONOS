@@ -1,5 +1,9 @@
-# ── Dataset txt/tsv fayllar (og'ir, gitga kirmasin) ──────────────────────────
-# data/ papkasidagi Python fayllar kuzatiladi (.py), dataset fayllar kuzatilmaydi
+# ══════════════════════════════════════════════════════════════════════════════
+# CHRONOS — .gitignore
+# Datasetlar, loglar, checkpointlar va ortiqcha fayllar gitga kirmasin
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Datasetlar (og'ir fayllar, gitga kirmasin) ────────────────────────────────
 data/ICEWS14/
 data/ICEWS18/
 data/WIKI/
@@ -9,7 +13,7 @@ data/GDELT/
 data/*.txt
 data/*.tsv
 
-# ── Checkpoint fayllar ────────────────────────────────────────────────────────
+# ── Checkpoint va model fayllar ───────────────────────────────────────────────
 checkpoints/
 *.pt
 *.pth
@@ -25,13 +29,17 @@ __pycache__/
 *$py.class
 *.pyc
 *.pyo
-.pytest_cache/
+*.pyd
 
 # ── Virtual environment ───────────────────────────────────────────────────────
 venv/
 env/
 .env
+.envrc
 .venv/
+ENV/
+env.bak/
+venv.bak/
 
 # ── IDE / editor ──────────────────────────────────────────────────────────────
 .vscode/
@@ -39,10 +47,14 @@ env/
 *.swp
 *.swo
 *~
+.spyderproject
+.spyproject
+.ropeproject
 
 # ── Claude / AI assistant fayllar ────────────────────────────────────────────
 .claude/
 CLAUDE.md
+tempCodeRunnerFile.py
 
 # ── OS fayllar ────────────────────────────────────────────────────────────────
 .DS_Store
@@ -52,8 +64,51 @@ desktop.ini
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 *.ipynb
+profile_default/
+ipython_config.py
+
+# ── Test / coverage ───────────────────────────────────────────────────────────
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+cover/
 
 # ── Build / dist ──────────────────────────────────────────────────────────────
 build/
 dist/
 *.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.spec
+*.manifest
+
+# ── Type checkers ─────────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ── Package managers ──────────────────────────────────────────────────────────
+.pdm-python
+.pdm-build/
+.pixi
+__pypackages__/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+.abstra/
+.streamlit/secrets.toml
+cython_debug/
+/site
