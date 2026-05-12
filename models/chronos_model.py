@@ -260,7 +260,7 @@ class TemporalRelationTransitionMemory(nn.Module):
 
         # Attention score
         attn_logit = self.attn_proj(trans).squeeze(-1)          # (B, H)
-        attn_logit = attn_logit.masked_fill(~hist_valid, -1e9)
+        attn_logit = attn_logit.masked_fill(~hist_valid, -3e4)  # FP16 safe (-1e9 overflow)
         # All-invalid rows → uniform weight (will be zeroed via context)
         has_valid  = hist_valid.any(dim=-1)                     # (B,)
         attn_w     = torch.softmax(attn_logit, dim=-1)          # (B, H)
@@ -866,7 +866,7 @@ class CHRONOSModel(nn.Module):
         n_valid  = valid_paths.sum(1).clamp(min=1)               # (B, 1)
         mean_p   = embs.sum(1) / n_valid                         # (B, D)
         # max (padding → -inf masking)
-        masked   = embs - (1 - valid_paths) * 1e9
+        masked   = embs - (1 - valid_paths) * 3e4  # FP16 safe
         max_p    = masked.max(1).values                          # (B, D)
 
         path_signal = self.path_agg(torch.cat([mean_p, max_p], dim=-1))  # (B, D)
