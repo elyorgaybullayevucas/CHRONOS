@@ -138,8 +138,22 @@ def main():
 
     logger.info(f"Device: {cfg.device}  |  FP16: {cfg.fp16}")
 
+    # User tomonidan o'zgartirilgan parametrlarni saqlash
+    # (Config() default dan farq qiluvchi barcha qiymatlar)
+    _default = Config()
+    _user_overrides = {
+        k: v for k, v in vars(cfg).items()
+        if v != getattr(_default, k, None)
+    }
+
     # Dataset sozlamalari dm.setup() DAN OLDIN
     _preset(cfg, logger)
+
+    # User override'lari preset dan ustun turadi
+    for k, v in _user_overrides.items():
+        setattr(cfg, k, v)
+    if _user_overrides:
+        logger.info(f"User overrides (preset ustidan): { {k: v for k, v in _user_overrides.items() if k not in ('dataset', 'device', 'save_dir', 'log_dir', 'seed')} }")
 
     logger.info(f"Dataset yuklanmoqda: {cfg.dataset} (reciprocal={cfg.use_reciprocal})")
     dm = CHRONOSDataModule(cfg)
