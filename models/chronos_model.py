@@ -143,7 +143,7 @@ class GRUPathEncoder(nn.Module):
         dropout:       float = 0.1,
     ):
         super().__init__()
-        self.rel_emb   = nn.Embedding(num_relations, rel_dim, padding_idx=0)
+        self.rel_emb   = nn.Embedding(num_relations + 1, rel_dim, padding_idx=num_relations)
         self.gru       = nn.GRU(rel_dim, out_dim, num_layers=1, batch_first=True)
         self.path_attn = nn.Linear(out_dim, 1, bias=False)
         self.norm      = nn.LayerNorm(out_dim)
@@ -194,7 +194,7 @@ class AttentiveHistoryEncoder(nn.Module):
     ):
         super().__init__()
         self.delta_dim = delta_dim
-        self.rel_emb    = nn.Embedding(num_relations, rel_dim, padding_idx=0)
+        self.rel_emb    = nn.Embedding(num_relations + 1, rel_dim, padding_idx=num_relations)
         self.delta_proj = nn.Linear(delta_dim, rel_dim)
 
         self.gru = nn.GRU(rel_dim * 2, hidden_dim, num_layers=1, batch_first=True)

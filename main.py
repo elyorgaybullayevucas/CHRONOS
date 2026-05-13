@@ -107,6 +107,7 @@ def _preset(cfg: Config, logger) -> None:
         cfg.label_smoothing= 0.1
         cfg.learning_rate  = 3e-4
         cfg.num_epochs     = 500 if cfg.dataset in ("YAGO", "YAGOs") else 150
+        cfg.eval_every     = 2 if cfg.dataset in ("YAGO", "YAGOs") else 1
         cfg.num_workers    = 8
         logger.info(f"{cfg.dataset}: epochs={cfg.num_epochs}, batch=512, history=32")
 
