@@ -351,6 +351,23 @@ class CHRONOSModel(nn.Module):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _complex_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """
+        ComplEx hadamard product — asimmetrik relatsiyalarni o'rgatadi.
+        a, b: (..., D)  — birinchi D/2 real, keyingi D/2 imaginary
+        out:  (..., D)  — [a_r*b_r - a_i*b_i , a_r*b_i + a_i*b_r]
+
+        DistMult (a*b) faqat simmetrik: score(s,r,o)=score(o,r,s).
+        ComplEx asimmetrik: score(s,r,o) != score(o,r,s).
+        DE-ComplEx adabiyotda YAGO da 92%+ beradi.
+        """
+        D2 = a.size(-1) // 2
+        a_r, a_i = a[..., :D2], a[..., D2:]
+        b_r, b_i = b[..., :D2], b[..., D2:]
+        return torch.cat([a_r * b_r - a_i * b_i,
+                          a_r * b_i + a_i * b_r], dim=-1)
+
     def _fix_rel(self, rel: torch.Tensor) -> torch.Tensor:
         """INV_OFFSET → num_base_relations offset, clamp to valid range."""
         inv = rel >= INV_OFFSET
@@ -380,7 +397,7 @@ class CHRONOSModel(nn.Module):
 
         s_t      = self.de_emb(subjects, t_n)              # (B, D)
         r_t      = self.tre(relations, times)              # (B, D)
-        distmult = s_t * r_t                               # (B, D) — base signal
+        distmult = self._complex_mul(s_t, r_t)             # (B, D) — ComplEx signal
 
         path_rels = self._fix_rel(paths[:, :, :, 1])      # (B, P, L)
         path_sig  = self.path_enc(path_rels, path_masks)  # (B, D)
