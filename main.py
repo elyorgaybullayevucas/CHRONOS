@@ -71,8 +71,10 @@ def parse_args() -> Config:
     for k, v in vars(args).items():
         if k == "no_fp16":
             cfg.fp16 = not v
-        elif k in ("use_history", "use_reciprocal") and v:
-            setattr(cfg, k, True)
+        elif k in ("use_history", "use_reciprocal"):
+            # action="store_true" — faqat True kelsa o'rnat, False kelsa Config defaulti (True) saqlansin
+            if v:
+                setattr(cfg, k, True)
         elif hasattr(cfg, k):
             setattr(cfg, k, v)
     return cfg
