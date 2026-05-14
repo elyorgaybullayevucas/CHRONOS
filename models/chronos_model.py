@@ -248,16 +248,18 @@ class CHRONOSModel(nn.Module):
         DaeMon uslubida path memory hisoblash.
         Barcha tensor float32 — FP16 autocast ostida xavfsiz.
         Returns: (B, N, d) float32
+
+        H_init one-hot approach: gradient query_emb ga to'g'ri o'tadi.
         """
         B = subjects.size(0)
         N = self.num_entities
         d = self.entity_dim
 
         # H_init: subjects pozitsiyasiga query embedding, qolgan joy 0
-        H_init = torch.zeros(B, N, d, device=device, dtype=torch.float32)
-        # scatter: H_init[b, subjects[b], :] = query[b, :]
-        subj_idx = subjects.view(B, 1, 1).expand(B, 1, d)
-        H_init.scatter_(1, subj_idx, query.float().unsqueeze(1))
+        # Differentiable: one_hot (no grad) * query (has grad) → H_init has grad
+        one_hot = torch.zeros(B, N, device=device, dtype=torch.float32)
+        one_hot.scatter_(1, subjects.unsqueeze(1).long(), 1.0)   # (B, N) binary mask
+        H_init = one_hot.unsqueeze(-1) * query.float().unsqueeze(1)  # (B, N, d) — grad ✓
 
         # Agar tarix bo'lmasa — faqat H_init ni qaytarish
         if not snapshot_graphs:
@@ -309,18 +311,14 @@ class CHRONOSModel(nn.Module):
         # Path memory score: sum over d dimension
         path_scores = (memory * query.unsqueeze(1)).sum(-1)            # (B, N)
 
-        # DE score per unique timestamp
-        unique_t, t_inv = torch.unique(times, return_inverse=True)
-        de_scores = torch.zeros(B, N, device=device, dtype=torch.float32)
-        for i, t_val in enumerate(unique_t):
-            mask  = t_inv == i
-            t_n   = t_val.float() / float(self.num_times)
-            t_exp = t_n.expand(N)
-            de_all = self.de_emb(all_ids, t_exp)                       # (N, d) f32
-            # (B_i, d) @ (d, N) → (B_i, N)
-            de_scores[mask] = query[mask].float() @ de_all.float().T
+        # DE score — trainer timestamp-ordered: barcha batch bir xil t
+        # times[0] ni ishlatamiz (torch.full ile to'ldirilgan, hammasi teng)
+        t_n    = times[0].float() / float(self.num_times)
+        t_exp  = t_n.expand(N)
+        de_all = self.de_emb(all_ids, t_exp)                          # (N, d) — grad ✓
+        de_scores = query.float() @ de_all.float().T                  # (B, N) — grad ✓
 
-        return path_scores + alpha * de_scores                         # (B, N) f32
+        return path_scores + alpha * de_scores                        # (B, N) f32
 
     # ── Forward (training) ────────────────────────────────────────────────────
 
