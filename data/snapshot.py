@@ -12,8 +12,8 @@ import numpy as np
 import torch
 
 
-# (src_tensor, rel_tensor, dst_tensor)
-SnapGraph = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+# (src_tensor, rel_tensor, dst_tensor, t_snap)
+SnapGraph = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]
 
 
 class SnapshotGraph:
@@ -70,10 +70,14 @@ class SnapshotGraph:
     # ── History retrieval ─────────────────────────────────────────────────────
 
     def get_history(self, t_query: int, history_len: int) -> List[SnapGraph]:
-        """t_query dan oldingi oxirgi history_len snapshot grafini qaytaradi."""
+        """
+        t_query dan oldingi oxirgi history_len snapshot grafini qaytaradi.
+        Returns: [(src, rel, dst, t_snap), ...] — oldest→newest order.
+        t_snap RTI (Relation-Temporal Importance) uchun kerak.
+        """
         past = [t for t in self._timestamps if t < t_query]
         past = past[-history_len:]
-        return [self._graphs[t] for t in past]
+        return [(*self._graphs[t], t) for t in past]
 
     def get_timestamps(self) -> List[int]:
         return self._timestamps

@@ -43,7 +43,7 @@ def parse_args() -> Config:
     p.add_argument("--dataset",    default="ICEWS18",
                    choices=["ICEWS14", "ICEWS18", "WIKI", "YAGO", "YAGOs", "GDELT"])
     p.add_argument("--data_dir",   default="data")
-    p.add_argument("--entity_dim", type=int,   default=128)
+    p.add_argument("--entity_dim", type=int,   default=64)
     p.add_argument("--dropout",    type=float, default=0.1)
     p.add_argument("--max_history",type=int,   default=10,    dest="max_history")
     p.add_argument("--epochs",     type=int,   default=30,    dest="num_epochs")
