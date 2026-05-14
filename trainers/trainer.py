@@ -51,22 +51,14 @@ class CHRONOSTrainer:
         self._raw.to(self.device)
         self.logger = get_logger("chronos_trainer", cfg.log_dir)
 
-        # ── Optimizer: 2-guruhli differentsial LR ─────────────────────────────
-        # Embedding lar — sekin o'rgansin
-        emb_params: list = []
-        for name in ("de_emb", "tre"):
-            m = getattr(self._raw, name, None)
-            if m is not None:
-                emb_params += list(m.parameters())
-
-        # Qolgan barcha — to'liq LR
-        emb_ids      = {id(p) for p in emb_params}
-        other_params = [p for p in self._raw.parameters() if id(p) not in emb_ids]
-
-        self.optimizer = AdamW([
-            {"params": emb_params,   "lr": cfg.learning_rate * 0.1},
-            {"params": other_params, "lr": cfg.learning_rate},
-        ], weight_decay=cfg.weight_decay)
+        # ── Optimizer: barcha parametrlar bir xil LR ──────────────────────────
+        # 1-N training da embedding lar asosiy o'rganish ob'ekti —
+        # 0.1x LR ular uchun juda sekin (DE paper: 0.001 barcha uchun)
+        self.optimizer = AdamW(
+            self._raw.parameters(),
+            lr           = cfg.learning_rate,
+            weight_decay = cfg.weight_decay,
+        )
 
         # ── OneCycleLR ────────────────────────────────────────────────────────
         steps_per_epoch = len(train_loader)
@@ -75,7 +67,7 @@ class CHRONOSTrainer:
 
         self.scheduler = OneCycleLR(
             self.optimizer,
-            max_lr          = [base_lr * 0.1, base_lr],
+            max_lr          = base_lr,
             total_steps     = total_steps,
             pct_start       = 0.05,
             anneal_strategy = "cos",

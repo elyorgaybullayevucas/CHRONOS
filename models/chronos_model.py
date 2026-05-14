@@ -444,7 +444,9 @@ class CHRONOSModel(nn.Module):
 
         return scores.clamp(-10, 10)
 
-    # ── Forward (training) ────────────────────────────────────────────────────
+    # ── Forward (training) — 1-N cross-entropy ────────────────────────────────
+    # BCE+negatives ~71% da to'xtaydi (faqat 512 entity dan ajratadi).
+    # 1-N: barcha E entity ustidan cross-entropy → DE-ComplEx 92.8% yetadi.
 
     def forward(
         self,
@@ -454,57 +456,52 @@ class CHRONOSModel(nn.Module):
         times:       torch.Tensor,
         paths:       torch.Tensor,
         path_masks:  torch.Tensor,
-        neg_objects: torch.Tensor,
+        neg_objects: torch.Tensor,          # 1-N da ishlatilmaydi (backward compat)
         history:     Optional[torch.Tensor] = None,
         hist_mask:   Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
-        B         = subjects.size(0)
-        rel_fixed = self._fix_rel(relations)
-        t_norm    = self._t_norm(times)
+        B      = subjects.size(0)
+        E      = self.num_entities
+        device = subjects.device
 
-        query = self._build_query(
+        rel_fixed = self._fix_rel(relations)
+        query     = self._build_query(
             subjects, rel_fixed, times, paths, path_masks, history, hist_mask
+        )                                                               # (B, D)
+
+        # ── 1-N scoring: loop over unique timestamps ──────────────────────────
+        # score[b, e] = query[b] · de_emb(e, t_b)
+        # Unique t loop → har timestamp uchun bir marta (E, D) hisoblash
+        all_ids          = torch.arange(E, device=device)
+        unique_t, t_inv  = torch.unique(times, return_inverse=True)
+
+        scores_parts = []   # har timestamp uchun (B_i, E) float32
+        objs_parts   = []
+
+        for i, t_val in enumerate(unique_t):
+            mask   = t_inv == i                                         # (B,) bool
+            t_n_i  = t_val.float() / float(self.num_times)
+            t_exp  = t_n_i.unsqueeze(0).expand(E)                      # (E,)
+            e_emb  = self.de_emb(all_ids, t_exp)                       # (E, D)
+            s_i    = query[mask].float() @ e_emb.float().T             # (B_i, E)
+            scores_parts.append(s_i)
+            objs_parts.append(objects[mask])
+
+        all_scores = torch.cat(scores_parts, dim=0)                    # (B, E) f32
+        all_objs   = torch.cat(objs_parts,   dim=0)                    # (B,)
+
+        # Cross-entropy with label smoothing (1-N)
+        link_loss = F.cross_entropy(
+            all_scores, all_objs,
+            label_smoothing=self.label_smoothing,
         )
 
-        # Temporal scoring: DE applied to object side too
-        pos_emb   = self.de_emb(objects, t_norm)                       # (B, D)
-        pos_score = (query * pos_emb).sum(-1)                          # (B,)
-
-        has_neg = neg_objects.size(1) > 0
-        if has_neg:
-            N       = neg_objects.size(1)
-            t_exp   = t_norm.unsqueeze(1).expand(B, N).reshape(-1)    # (B*N,)
-            neg_emb = self.de_emb(neg_objects.reshape(-1), t_exp)     # (B*N, D)
-            neg_score = (
-                query.unsqueeze(1) * neg_emb.view(B, N, -1)
-            ).sum(-1)                                                   # (B, N)
-        else:
-            neg_score = query.new_zeros(B, 1)
-
-        # BCE with label smoothing
-        sm = self.label_smoothing
-
-        def bce_ls(logit: torch.Tensor, label: float) -> torch.Tensor:
-            tgt = torch.full_like(logit, label * (1 - sm) + sm * 0.5)
-            return F.binary_cross_entropy_with_logits(logit, tgt)
-
-        link_loss = bce_ls(pos_score, 1.0) + bce_ls(neg_score, 0.0)
-
-        # Self-adversarial negative sampling
-        if has_neg:
-            with torch.no_grad():
-                temp  = self.rel_temp(rel_fixed).squeeze(-1).abs().clamp(0.5, 10)
-                adv_w = torch.softmax(
-                    neg_score.detach() * temp.unsqueeze(-1), dim=1
-                )
-            sa_loss = -(adv_w * F.logsigmoid(-neg_score)).sum(1).mean()
-        else:
-            sa_loss = query.new_tensor(0.0)
+        pos_score = all_scores[torch.arange(B, device=device), all_objs]
 
         losses = {
             "link":      link_loss,
-            "self_adv":  sa_loss,
+            "self_adv":  query.new_tensor(0.0),   # 1-N da kerak emas
             "pcl":       query.new_tensor(0.0),
             "ortho_reg": query.new_tensor(0.0),
         }
