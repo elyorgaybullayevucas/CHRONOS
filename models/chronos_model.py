@@ -484,7 +484,7 @@ class CHRONOSModel(nn.Module):
             t_n_i  = t_val.float() / float(self.num_times)
             t_exp  = t_n_i.unsqueeze(0).expand(E)                      # (E,)
             e_emb  = self.de_emb(all_ids, t_exp)                       # (E, D)
-            s_i    = query[mask].float() @ e_emb.float().T             # (B_i, E)
+            s_i    = (query[mask].float() @ e_emb.float().T).float()   # (B_i, E) f32 — autocast ostida matmul fp16 qaytaradi!
             scores_parts.append(s_i)
             objs_parts.append(objects[mask])
 
