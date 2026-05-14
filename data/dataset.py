@@ -87,9 +87,14 @@ class CHRONOSDataset(Dataset):
             self.rel_to_objects[r].append(o)
 
         # ── Filter dict ───────────────────────────────────────────────────────
+        # Tail prediction: (s, r, t) → valid objects
+        # Head prediction: (o, r_inv, t) → valid subjects  (DaeMon evaluation protocol)
         self.filter_dict: Dict[Tuple, Set[int]] = defaultdict(set)
         for s, r, o, t in self.all_quads:
             self.filter_dict[(s, r, t)].add(o)
+            # inverse: head prediction (o, r^{-1}, t) → valid s
+            r_inv = r + self._base_relations
+            self.filter_dict[(o, r_inv, t)].add(s)
 
         self.all_ent_ids = list(range(self.num_entities))
 

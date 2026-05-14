@@ -26,7 +26,7 @@ class Config:
 
     # ── History ───────────────────────────────────────────────────────────────
     use_history:    bool = True
-    max_history:    int  = 32
+    max_history:    int  = 10     # NEXUS snapshot history length (DaeMon: 10-25)
     use_reciprocal: bool = True
 
     # ── Training ──────────────────────────────────────────────────────────────

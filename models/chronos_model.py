@@ -1,41 +1,45 @@
 # models/chronos_model.py
 """
-NOVA — Neural Object-Valued Approximation for TKG Extrapolation.
+NEXUS — Neural EXtrapolation with Unified Snapshot-graphs
 
-Architecture:
-  1. DEEntityEmbedding  — periodic + trend temporal modulation
-  2. TemporalRelationEncoding — sinusoidal time + relation
-  3. GRUPathEncoder     — 1-layer GRU per path + masked attention
-  4. AttentiveHistoryEncoder — GRU + query-aware attention, separate projections
-  5. Residual query     — query = LN(distmult + ctx_mlp([hist, path]))
-       ctx_mlp zero-init → pure DistMult baseline at start
-  6. Temporal scoring   — score[b,e] = query[b]·e_t_b(e), loop unique_t
-  7. Loss               — BCE label-smoothing + self-adversarial
+DaeMon dan yaxshiroq model, 3 ta aniq ilmiy yangilik:
+  1. DE entity embeddings  — DaeMon entity-free; biz temporal entity
+                             modulatsiyasi qo'shamiz (periodic + trend).
+                             → Entity-specific temporal patterns
+  2. 1-N cross-entropy     — DaeMon BCE+64 neg (sampling ceiling).
+                             1-N: barcha E entity ustidan CE → to'liq gradient.
+                             → Ma'lumot bottleneck yo'q
+  3. Bilinear joint score  — score = (memory + de_emb) · query
+                             → Ikki signal kombinatsiyasi
 
-FP16 safety:
-  - DE: periodic/trend computed float32, cast to e.dtype at end
-  - _score_all: always float32 (query.float() + ent_emb.float())
-  - masked_fill: -3e4 (not -1e9)
-  - scores clamped [-10, 10]
+Asosiy arxitektura (DaeMon bilan bir xil):
+  - Query embedding: Embedding(2R, d)
+  - Path memory: H ∈ R^{B × N × d}
+  - PAU: 2-layer query-aware distmult message passing (PyTorch scatter, DGL yoq)
+  - MPS: time-aware gate  H = σ(W·M)·H_init + (1-σ(W·M))·M_prev
+  - Score: (H[b,e] + de(e,t)) · query[b]
+  - Loss: 1-N CE + ortho regularizer
+
+FP16 xavfsizligi:
+  - _compute_memory: barcha hisob float32
+  - scatter_add: non-in-place (gradient uchun)
+  - de_emb: float32 qaytaradi
 """
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.paths import INV_OFFSET
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sinusoidal encoding — always float32, dim must be even
+# Sinusoidal encoding
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sinusoidal_enc(t: torch.Tensor, dim: int) -> torch.Tensor:
-    """t: (...) → (..., dim) float32.  dim must be even."""
     if dim % 2 != 0:
-        raise ValueError(f"sinusoidal_enc requires even dim, got {dim}")
+        raise ValueError(f"sinusoidal_enc: dim must be even, got {dim}")
     shape  = t.shape
     t_flat = t.float().reshape(-1, 1).clamp(0, 1e5)
     half   = dim // 2
@@ -43,28 +47,21 @@ def sinusoidal_enc(t: torch.Tensor, dim: int) -> torch.Tensor:
         torch.arange(half, device=t_flat.device, dtype=torch.float32)
         * -(math.log(10000.0) / half)
     )
-    args = t_flat * div                                      # (N, half)
+    args = t_flat * div
     enc  = torch.empty(t_flat.size(0), dim, device=t_flat.device, dtype=torch.float32)
     enc[:, 0::2] = torch.sin(args)
     enc[:, 1::2] = torch.cos(args)
     return enc.reshape(*shape, dim)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 1. DE Entity Embedding — periodic + trend
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# DE Entity Embedding
+# ─────────────────────────────────────────────────────────────────────────────
 
 class DEEntityEmbedding(nn.Module):
     """
-    e_t(s) = cat(
-        e_s[:D/2] ⊙ (1 + amp · sin(freq · t + phase)),   # periodic
-        e_s[D/2:] + trend_s · t_norm                       # linear trend
-    )
-
-    - periodic: captures cyclic patterns (YAGO birth/death years, WIKI)
-    - trend: captures long-term drift (WIKI topic evolution, ICEWS political shift)
-    - trend zero-initialized → no drift at start, learned if useful
-    - All modulation in float32, cast to e.dtype → FP16 safe
+    Diachronic Embedding: periodic + trend temporal modulation.
+    Always returns float32.
     """
 
     def __init__(self, num_entities: int, dim: int):
@@ -75,224 +72,133 @@ class DEEntityEmbedding(nn.Module):
         self.freq  = nn.Embedding(num_entities, self.mod_dim)
         self.phase = nn.Embedding(num_entities, self.mod_dim)
         self.trend = nn.Embedding(num_entities, self.mod_dim)
-
         nn.init.xavier_uniform_(self.emb.weight)
         nn.init.constant_(self.amp.weight,  0.1)
         nn.init.uniform_(self.freq.weight,  0.01, 2.0)
         nn.init.uniform_(self.phase.weight, 0.0, math.pi)
-        nn.init.zeros_(self.trend.weight)   # no drift at init
+        nn.init.zeros_(self.trend.weight)
 
     def forward(self, entities: torch.Tensor, t_norm: torch.Tensor) -> torch.Tensor:
-        """
-        entities : (N,)  long
-        t_norm   : (N,)  float  [0, 1]
-        returns  : (N, dim)  dtype = emb.weight.dtype
-        """
-        e = self.emb(entities)                              # (N, dim)
-        t = t_norm.float().unsqueeze(-1)                    # (N, 1) f32
-
-        # Float32 intermediate for sin precision
-        amp = torch.sigmoid(self.amp(entities).float())     # (N, mod_dim) f32
-        frq = F.softplus(self.freq(entities).float())       # (N, mod_dim) f32
-        phi = self.phase(entities).float()                  # (N, mod_dim) f32
-        trd = self.trend(entities).float()                  # (N, mod_dim) f32
-
-        # Periodic modulation (first half)
-        mod      = amp * torch.sin(frq * t + phi)           # f32
-        periodic = e[:, :self.mod_dim] * (1.0 + mod.to(e.dtype))
-
-        # Linear trend (second half)
-        trended  = e[:, self.mod_dim:] + (trd * t).to(e.dtype)
-
-        return torch.cat([periodic, trended], dim=-1)       # (N, dim)
+        """entities: (N,)  t_norm: (N,) → (N, dim) float32"""
+        e    = self.emb(entities).float()
+        t    = t_norm.float().unsqueeze(-1)
+        amp  = torch.sigmoid(self.amp(entities).float())
+        frq  = F.softplus(self.freq(entities).float())
+        phi  = self.phase(entities).float()
+        trd  = self.trend(entities).float()
+        mod  = amp * torch.sin(frq * t + phi)
+        periodic = e[:, :self.mod_dim] * (1.0 + mod)
+        trended  = e[:, self.mod_dim:] + trd * t
+        return torch.cat([periodic, trended], dim=-1)   # (N, d) float32
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2. Temporal Relation Encoding
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# PAU Layer  (scatter_add non-in-place — gradient safe)
+# ─────────────────────────────────────────────────────────────────────────────
 
-class TemporalRelationEncoding(nn.Module):
-    """r_t = LayerNorm(rel_emb[r] + sin_proj(t))"""
+class PAULayer(nn.Module):
+    """
+    Path Aggregation Unit — DGL/PyG'siz scatter implementatsiyasi.
 
-    def __init__(self, num_relations: int, dim: int, delta_dim: int = 64):
+    msg(j→i) = H[j] * (W_q[b] ⊙ w_rel[e])  +  H_init[j]
+    agg(i)   = mean scatter_add (non-in-place)
+    H_new[i] = LN(ReLU(Linear(cat(H[i], agg(i)))))
+
+    Barcha operatsiyalar float32 — FP16 autocast xavfsizligi.
+    """
+
+    def __init__(self, dim: int, num_rels: int, dropout: float = 0.1):
         super().__init__()
-        self.delta_dim = delta_dim
-        self.rel_emb   = nn.Embedding(num_relations, dim)
-        self.sin_proj  = nn.Linear(delta_dim, dim)
-        self.norm      = nn.LayerNorm(dim)
-        nn.init.xavier_uniform_(self.rel_emb.weight)
-
-    def forward(self, relations: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
-        r  = self.rel_emb(relations)
-        dt = self.sin_proj(sinusoidal_enc(times, self.delta_dim))
-        return self.norm(r + dt)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3. GRU Path Encoder
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class GRUPathEncoder(nn.Module):
-    """(B, P, L) → 1-layer GRU → masked attention → (B, out_dim)"""
-
-    def __init__(
-        self,
-        num_relations: int,
-        rel_dim:       int,
-        out_dim:       int,
-        dropout:       float = 0.1,
-    ):
-        super().__init__()
-        self.rel_emb   = nn.Embedding(num_relations + 1, rel_dim, padding_idx=num_relations)
-        self.gru       = nn.GRU(rel_dim, out_dim, num_layers=1, batch_first=True)
-        self.path_attn = nn.Linear(out_dim, 1, bias=False)
-        self.norm      = nn.LayerNorm(out_dim)
-        self.drop      = nn.Dropout(dropout)
+        self.dim      = dim
+        self.num_rels = num_rels
+        # Relation embedding
+        self.rel_emb    = nn.Embedding(num_rels + 1, dim, padding_idx=num_rels)
+        nn.init.xavier_uniform_(self.rel_emb.weight[:-1])
+        # Query projection (query-aware)
+        self.query_proj = nn.Linear(dim, dim, bias=False)
+        # Update
+        self.update     = nn.Linear(dim * 2, dim)
+        self.norm       = nn.LayerNorm(dim)
+        self.drop       = nn.Dropout(dropout)
 
     def forward(
         self,
-        path_rels:  torch.Tensor,   # (B, P, L)
-        path_masks: torch.Tensor,   # (B, P)  True=padding
-    ) -> torch.Tensor:
-        B, P, L = path_rels.shape
-        rel_e     = self.rel_emb(path_rels.view(B * P, L))      # (B*P, L, rel_dim)
-        _, h_n    = self.gru(rel_e)                              # (1, B*P, out_dim)
-        path_vecs = self.drop(h_n.squeeze(0).view(B, P, -1))    # (B, P, out_dim)
+        H:       torch.Tensor,   # (B, N, d) float32
+        H_init:  torch.Tensor,   # (B, N, d) float32
+        query:   torch.Tensor,   # (B, d)    float32
+        src:     torch.Tensor,   # (E,) long
+        rel:     torch.Tensor,   # (E,) long
+        dst:     torch.Tensor,   # (E,) long
+        N:       int,
+    ) -> torch.Tensor:           # (B, N, d) float32
+        B, _, d = H.shape
+        E       = src.size(0)
+        device  = H.device
 
-        attn_logit = self.path_attn(path_vecs).squeeze(-1)       # (B, P)
-        attn_logit = attn_logit.masked_fill(path_masks, -3e4)
-        attn_w     = torch.softmax(attn_logit, dim=-1)
+        # Empty snapshot — return update with zero agg
+        if E == 0:
+            agg = torch.zeros(B, N, d, device=device, dtype=torch.float32)
+            out = self.update(torch.cat([H, agg], dim=-1))
+            return self.norm(self.drop(F.relu(out)))
 
-        valid  = (~path_masks).float()
-        attn_w = attn_w * valid
-        attn_w = attn_w / attn_w.sum(-1, keepdim=True).clamp(1e-8)
+        # Safety clamp relation indices
+        rel = rel.clamp(0, self.num_rels - 1)
 
-        has_path = valid.any(dim=-1).float().unsqueeze(-1)       # (B, 1)
-        agg      = (attn_w.unsqueeze(-1) * path_vecs).sum(1)    # (B, out_dim)
-        return self.norm(agg * has_path)
+        # Relation and query weights
+        w_rel = self.rel_emb(rel).float()                              # (E, d)
+        w_q   = self.query_proj(query).float()                         # (B, d)
 
+        # Distmult message + H_init augmentation (DaeMon style)
+        src_h  = H[:, src, :].float()                                  # (B, E, d)
+        init_s = H_init[:, src, :].float()                             # (B, E, d)
+        w_comb = w_q.unsqueeze(1) * w_rel.unsqueeze(0)                # (B, E, d)
+        msg    = src_h * w_comb + init_s                               # (B, E, d)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. GRU + Query-Aware History Encoder
-# ═══════════════════════════════════════════════════════════════════════════════
+        # Non-in-place scatter_add (gradient flows correctly through msg)
+        dst_exp = dst.view(1, E, 1).expand(B, E, d)                   # (B, E, d)
+        agg_sum = torch.zeros(B, N, d, device=device, dtype=torch.float32)
+        agg_sum = agg_sum.scatter_add(1, dst_exp, msg)                 # non-in-place
 
-class AttentiveHistoryEncoder(nn.Module):
-    """
-    GRU over (rel_emb ⊕ Δt_enc) → hidden states + last state.
-    Query-aware dot-product attention (DistMult signal as query).
-    Gate: attn_out ↔ gru_last via separate projections (no weight sharing).
-    """
+        # Degree normalization (no grad needed)
+        with torch.no_grad():
+            count = torch.zeros(N, device=device, dtype=torch.float32)
+            count.scatter_add_(0, dst, torch.ones(E, device=device))
+            count = count.clamp(min=1.0).view(1, N, 1)
+        agg = agg_sum / count                                          # (B, N, d)
 
-    def __init__(
-        self,
-        num_relations: int,
-        rel_dim:       int,
-        hidden_dim:    int,
-        out_dim:       int,
-        delta_dim:     int   = 32,
-        dropout:       float = 0.1,
-    ):
-        super().__init__()
-        self.delta_dim = delta_dim
-        self.rel_emb    = nn.Embedding(num_relations + 1, rel_dim, padding_idx=num_relations)
-        self.delta_proj = nn.Linear(delta_dim, rel_dim)
-
-        self.gru = nn.GRU(rel_dim * 2, hidden_dim, num_layers=1, batch_first=True)
-
-        # Separate projections — key_proj for attention, h_last_proj for gate
-        self.key_proj    = nn.Linear(hidden_dim, out_dim, bias=False)
-        self.h_last_proj = nn.Linear(hidden_dim, out_dim, bias=False)
-
-        self.gate_proj = nn.Sequential(nn.Linear(out_dim * 2, out_dim), nn.Sigmoid())
-        self.out_proj  = nn.Linear(out_dim, out_dim)
-        self.norm      = nn.LayerNorm(out_dim)
-        self.drop      = nn.Dropout(dropout)
-        self.scale     = out_dim ** -0.5
-
-    def forward(
-        self,
-        hist_rels:    torch.Tensor,   # (B, H) long
-        hist_dt:      torch.Tensor,   # (B, H) float, Δt ≥ 0
-        hist_mask:    torch.Tensor,   # (B, H) bool, True=padding
-        query_signal: torch.Tensor,   # (B, out_dim) DistMult
-    ) -> torch.Tensor:
-        B, H = hist_rels.shape
-
-        rel_e = self.rel_emb(hist_rels)                          # (B, H, rel_dim)
-        dt_e  = self.delta_proj(
-            sinusoidal_enc(hist_dt.reshape(-1), self.delta_dim).reshape(B, H, -1)
-        )                                                         # (B, H, rel_dim)
-        x = torch.cat([rel_e, dt_e], dim=-1)                    # (B, H, 2*rel_dim)
-
-        lengths = (~hist_mask).sum(dim=1).clamp(min=1).cpu()
-        packed  = nn.utils.rnn.pack_padded_sequence(
-            x, lengths, batch_first=True, enforce_sorted=False
-        )
-        out_packed, h_n = self.gru(packed)
-        out, _ = nn.utils.rnn.pad_packed_sequence(
-            out_packed, batch_first=True, total_length=H
-        )                                                         # (B, H, hidden_dim)
-        h_last = self.drop(h_n.squeeze(0))                      # (B, hidden_dim)
-
-        # Attention keys (key_proj) — separate from gate projection
-        hist_keys = self.key_proj(out)                           # (B, H, out_dim)
-        attn_s    = (query_signal.unsqueeze(1) * hist_keys).sum(-1) * self.scale
-        attn_s    = attn_s.masked_fill(hist_mask, -3e4)
-        attn_w    = torch.softmax(attn_s, dim=-1)
-
-        valid    = (~hist_mask).float()
-        attn_w   = attn_w * valid
-        attn_w   = attn_w / attn_w.sum(-1, keepdim=True).clamp(1e-8)
-        attn_out = (attn_w.unsqueeze(-1) * hist_keys).sum(1)    # (B, out_dim)
-
-        # Last state (h_last_proj) — separate linear
-        h_proj = self.h_last_proj(h_last)                       # (B, out_dim)
-
-        gate  = self.gate_proj(torch.cat([attn_out, h_proj], dim=-1))
-        fused = gate * attn_out + (1 - gate) * h_proj
-        out_v = self.out_proj(self.drop(fused))
-
-        has_hist = valid.any(dim=-1).float().unsqueeze(-1)
-        return self.norm(out_v * has_hist)
+        # Update: LN(ReLU(Linear(cat(H, agg))))
+        out = self.update(torch.cat([H, agg], dim=-1))                 # (B, N, d)
+        return self.norm(self.drop(F.relu(out)))
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5. NOVA — main model
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# NEXUS Model
+# ─────────────────────────────────────────────────────────────────────────────
+
+SnapGraph = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
 
 class CHRONOSModel(nn.Module):
     """
-    NOVA: DistMult + DE(periodic+trend) + GRU-Path + GRU-QA-History.
-
-    Residual query:
-      query = LN(distmult + ctx_mlp([hist_sig, path_sig]))
-      ctx_mlp last layer zero-init → starts as pure DistMult, learns corrections.
-
-    score[b,e] = query[b] · e_t_b(e)  — temporally correct, no B×E×D.
+    NEXUS: DaeMon path memory + DE entity embeddings + 1-N CE.
+    score(s, r, o, t) = (memory[b,o] + de(o,t)) · query(r)
     """
 
     def __init__(
         self,
         num_entities:    int,
-        num_relations:   int,
+        num_relations:   int,           # base (inversesiz)
         num_times:       int,
-        entity_dim:      int   = 256,
-        relation_dim:    int   = 256,
-        hidden_dim:      int   = 512,
-        delta_dim:       int   = 64,
-        # backward compat (unused)
-        num_heads:       int   = 8,
-        num_layers:      int   = 2,
-        ffn_dim:         int   = 1024,
-        num_patterns:    int   = 128,
-        num_trtm_bins:   int   = 32,
-        num_negative:    int   = 256,
+        entity_dim:      int   = 128,
+        relation_dim:    int   = 128,   # compat, unused
+        hidden_dim:      int   = 256,   # compat, unused
+        delta_dim:       int   = 64,    # compat, unused
         dropout:         float = 0.1,
         label_smoothing: float = 0.1,
-        w_direct:        float = 0.0,
-        w_pcl:           float = 0.0,
         use_history:     bool  = True,
-        max_history:     int   = 32,
+        max_history:     int   = 10,
+        num_pau_layers:  int   = 2,
+        **kwargs,
     ):
         super().__init__()
         self.num_entities       = num_entities
@@ -300,228 +206,177 @@ class CHRONOSModel(nn.Module):
         self.total_relations    = num_relations * 2
         self.num_times          = max(num_times, 1)
         self.entity_dim         = entity_dim
-        self.use_history        = use_history
         self.label_smoothing    = label_smoothing
+        self.max_history        = max_history
 
-        # 1. DE embedding (periodic + trend)
-        self.de_emb = DEEntityEmbedding(num_entities, entity_dim)
+        d = entity_dim
+        R = self.total_relations
 
-        # 2. Temporal relation encoding
-        self.tre = TemporalRelationEncoding(
-            self.total_relations, entity_dim, delta_dim
-        )
+        # ── Query embedding (DaeMon style) ───────────────────────────────────
+        self.query_emb = nn.Embedding(R, d)
+        nn.init.xavier_uniform_(self.query_emb.weight)
 
-        # 3. GRU path encoder  (rel_dim = entity_dim // 2)
-        self.path_enc = GRUPathEncoder(
-            num_relations = self.total_relations,
-            rel_dim       = entity_dim // 2,
-            out_dim       = entity_dim,
-            dropout       = dropout,
-        )
+        # ── PAU layers ───────────────────────────────────────────────────────
+        self.pau_layers = nn.ModuleList([
+            PAULayer(dim=d, num_rels=R, dropout=dropout)
+            for _ in range(num_pau_layers)
+        ])
 
-        # 4. GRU + QA history encoder
-        if use_history:
-            self.hist_enc = AttentiveHistoryEncoder(
-                num_relations = self.total_relations,
-                rel_dim       = entity_dim // 2,
-                hidden_dim    = hidden_dim // 2,
-                out_dim       = entity_dim,
-                delta_dim     = delta_dim // 2,
-                dropout       = dropout,
-            )
+        # ── Memory gate (DaeMon tawaregate) ──────────────────────────────────
+        self.gate_weight = nn.Linear(d, d)
 
-        # 5. Context MLP: [hist_sig, path_sig] → additive correction to distmult
-        #    Input is always 2*entity_dim (hist_sig=zeros when no history)
-        self.ctx_mlp = nn.Sequential(
-            nn.Linear(entity_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, entity_dim),
-        )
-        # Zero-init last layer → ctx=0 at init → pure DistMult baseline
-        nn.init.zeros_(self.ctx_mlp[-1].weight)
-        nn.init.zeros_(self.ctx_mlp[-1].bias)
+        # ── DE entity embedding ───────────────────────────────────────────────
+        self.de_emb = DEEntityEmbedding(num_entities, d)
 
-        # 6. Query normalization
-        self.query_norm = nn.LayerNorm(entity_dim)
-
-        # 7. Self-adversarial temperature per relation
-        self.rel_temp = nn.Embedding(self.total_relations, 1)
-        nn.init.constant_(self.rel_temp.weight, 1.0)
+        # ── Learnable DE blend weight ─────────────────────────────────────────
+        self.de_alpha = nn.Parameter(torch.tensor(0.0))   # sigmoid(0) = 0.5
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _complex_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """
-        ComplEx hadamard product — asimmetrik relatsiyalarni o'rgatadi.
-        a, b: (..., D)  — birinchi D/2 real, keyingi D/2 imaginary
-        out:  (..., D)  — [a_r*b_r - a_i*b_i , a_r*b_i + a_i*b_r]
-
-        DistMult (a*b) faqat simmetrik: score(s,r,o)=score(o,r,s).
-        ComplEx asimmetrik: score(s,r,o) != score(o,r,s).
-        DE-ComplEx adabiyotda YAGO da 92%+ beradi.
-        """
-        D2 = a.size(-1) // 2
-        a_r, a_i = a[..., :D2], a[..., D2:]
-        b_r, b_i = b[..., :D2], b[..., D2:]
-        return torch.cat([a_r * b_r - a_i * b_i,
-                          a_r * b_i + a_i * b_r], dim=-1)
-
     def _fix_rel(self, rel: torch.Tensor) -> torch.Tensor:
-        """INV_OFFSET → num_base_relations offset, clamp to valid range."""
-        inv = rel >= INV_OFFSET
-        if inv.any():
-            rel = rel.clone()
-            rel[inv] = (rel[inv] - INV_OFFSET) + self.num_base_relations
+        """Relation indekslarini [0, 2R-1] ga clamp qilish."""
         return rel.clamp(0, self.total_relations - 1)
 
-    def _t_norm(self, times: torch.Tensor) -> torch.Tensor:
-        return times.float() / float(self.num_times)
-
-    # ── Query builder ─────────────────────────────────────────────────────────
-
-    def _build_query(
+    def _compute_memory(
         self,
-        subjects:   torch.Tensor,           # (B,)
-        relations:  torch.Tensor,           # (B,) already _fix_rel'd
-        times:      torch.Tensor,           # (B,)
-        paths:      torch.Tensor,           # (B, P, L, 3)
-        path_masks: torch.Tensor,           # (B, P)  True=padding
-        history:    Optional[torch.Tensor], # (B, H, 3)
-        hist_mask:  Optional[torch.Tensor], # (B, H)  True=padding
+        subjects:        torch.Tensor,       # (B,)  long
+        query:           torch.Tensor,        # (B, d) float32
+        snapshot_graphs: List[SnapGraph],
+        device:          torch.device,
     ) -> torch.Tensor:
-        """Returns query (B, entity_dim)."""
-        B   = subjects.size(0)
-        t_n = self._t_norm(times)
+        """
+        DaeMon uslubida path memory hisoblash.
+        Barcha tensor float32 — FP16 autocast ostida xavfsiz.
+        Returns: (B, N, d) float32
+        """
+        B = subjects.size(0)
+        N = self.num_entities
+        d = self.entity_dim
 
-        s_t      = self.de_emb(subjects, t_n)              # (B, D)
-        r_t      = self.tre(relations, times)              # (B, D)
-        distmult = self._complex_mul(s_t, r_t)             # (B, D) — ComplEx signal
+        # H_init: subjects pozitsiyasiga query embedding, qolgan joy 0
+        H_init = torch.zeros(B, N, d, device=device, dtype=torch.float32)
+        # scatter: H_init[b, subjects[b], :] = query[b, :]
+        subj_idx = subjects.view(B, 1, 1).expand(B, 1, d)
+        H_init.scatter_(1, subj_idx, query.float().unsqueeze(1))
 
-        path_rels = self._fix_rel(paths[:, :, :, 1])      # (B, P, L)
-        path_sig  = self.path_enc(path_rels, path_masks)  # (B, D)
+        # Agar tarix bo'lmasa — faqat H_init ni qaytarish
+        if not snapshot_graphs:
+            return H_init
 
-        if self.use_history and history is not None:
-            hist_rels = self._fix_rel(history[:, :, 1])   # (B, H)
-            hist_dt   = (times.unsqueeze(-1) - history[:, :, 2]).float().clamp(0)
-            hist_sig  = self.hist_enc(hist_rels, hist_dt, hist_mask, distmult)
-        else:
-            hist_sig = distmult.new_zeros(B, self.entity_dim)
+        memory   = H_init.clone()
+        is_first = True
 
-        # Residual: distmult preserved, ctx_mlp adds learned correction
-        # When hist=zeros and path=zeros: ctx≈0 (zero-init) → query≈LN(distmult)
-        ctx   = self.ctx_mlp(torch.cat([hist_sig, path_sig], dim=-1))
-        query = self.query_norm(distmult + ctx)
-        return query
+        for snap_src, snap_rel, snap_dst in snapshot_graphs:
+            snap_src = snap_src.to(device)
+            snap_rel = snap_rel.to(device)
+            snap_dst = snap_dst.to(device)
 
-    # ── Temporal all-entity scoring (predict only) ────────────────────────────
+            # Memory Passing Strategy: time-aware gate (DaeMon tawaregate)
+            if is_first:
+                H        = H_init.clone()
+                is_first = False
+            else:
+                # gate: σ(W · memory)  →  (B, N, d)
+                gate = torch.sigmoid(
+                    self.gate_weight(memory.float())
+                ).float()
+                H = gate * H_init + (1.0 - gate) * memory
+
+            # w-layer PAU (float32 ichida)
+            q_f32 = query.float()
+            for layer in self.pau_layers:
+                H = layer(H, H_init, q_f32, snap_src, snap_rel, snap_dst, N)
+
+            memory = H
+
+        return memory    # (B, N, d) float32
 
     def _score_all(
-        self, query: torch.Tensor, times: torch.Tensor
+        self,
+        memory: torch.Tensor,   # (B, N, d) float32
+        query:  torch.Tensor,   # (B, d)    float32
+        times:  torch.Tensor,   # (B,)      long
+        device: torch.device,
     ) -> torch.Tensor:
         """
-        score[b, e] = query[b] · e_{t_b}(e)
-
-        Loop over unique time steps: per step, (E, D) DE once → (b_i, E) matmul.
-        No B×E×D expansion. All float32 for FP16 safety.
+        score[b, e] = memory[b,e]·query[b]  +  alpha · de(e,t_b)·query[b]
+        Returns: (B, N) float32
         """
-        B      = query.size(0)
-        E      = self.num_entities
-        device = query.device
+        B, N, _ = memory.shape
+        all_ids  = torch.arange(N, device=device)
+        alpha    = torch.sigmoid(self.de_alpha)
 
+        # Path memory score: sum over d dimension
+        path_scores = (memory * query.unsqueeze(1)).sum(-1)            # (B, N)
+
+        # DE score per unique timestamp
         unique_t, t_inv = torch.unique(times, return_inverse=True)
-        all_ids = torch.arange(E, device=device)
-        scores  = torch.zeros(B, E, device=device, dtype=torch.float32)
-        q32     = query.float()
-
+        de_scores = torch.zeros(B, N, device=device, dtype=torch.float32)
         for i, t_val in enumerate(unique_t):
-            mask    = t_inv == i                             # (B,) bool
-            t_n     = t_val.float() / float(self.num_times)
-            t_exp   = t_n.unsqueeze(0).expand(E)            # (E,) same value
-            ent_emb = self.de_emb(all_ids, t_exp).float()  # (E, D) f32
-            scores[mask] = (q32[mask] @ ent_emb.T).float()  # (b_i, E) — force f32
+            mask  = t_inv == i
+            t_n   = t_val.float() / float(self.num_times)
+            t_exp = t_n.expand(N)
+            de_all = self.de_emb(all_ids, t_exp)                       # (N, d) f32
+            # (B_i, d) @ (d, N) → (B_i, N)
+            de_scores[mask] = query[mask].float() @ de_all.float().T
 
-        return scores.clamp(-10, 10)
+        return path_scores + alpha * de_scores                         # (B, N) f32
 
-    # ── Forward (training) — 1-N cross-entropy ────────────────────────────────
-    # BCE+negatives ~71% da to'xtaydi (faqat 512 entity dan ajratadi).
-    # 1-N: barcha E entity ustidan cross-entropy → DE-ComplEx 92.8% yetadi.
+    # ── Forward (training) ────────────────────────────────────────────────────
 
     def forward(
         self,
-        subjects:    torch.Tensor,
-        relations:   torch.Tensor,
-        objects:     torch.Tensor,
-        times:       torch.Tensor,
-        paths:       torch.Tensor,
-        path_masks:  torch.Tensor,
-        neg_objects: torch.Tensor,          # 1-N da ishlatilmaydi (backward compat)
-        history:     Optional[torch.Tensor] = None,
-        hist_mask:   Optional[torch.Tensor] = None,
+        subjects:        torch.Tensor,
+        relations:       torch.Tensor,
+        objects:         torch.Tensor,
+        times:           torch.Tensor,
+        snapshot_graphs: List[SnapGraph],
+        # Legacy compat (ignored in NEXUS):
+        paths=None, path_masks=None, neg_objects=None,
+        history=None,   hist_mask=None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
-        B      = subjects.size(0)
-        E      = self.num_entities
-        device = subjects.device
-
+        device    = subjects.device
         rel_fixed = self._fix_rel(relations)
-        query     = self._build_query(
-            subjects, rel_fixed, times, paths, path_masks, history, hist_mask
-        )                                                               # (B, D)
+        query     = self.query_emb(rel_fixed).float()                  # (B, d)
 
-        # ── 1-N scoring: loop over unique timestamps ──────────────────────────
-        # score[b, e] = query[b] · de_emb(e, t_b)
-        # Unique t loop → har timestamp uchun bir marta (E, D) hisoblash
-        all_ids          = torch.arange(E, device=device)
-        unique_t, t_inv  = torch.unique(times, return_inverse=True)
+        memory = self._compute_memory(subjects, query, snapshot_graphs, device)
+        scores = self._score_all(memory, query, times, device)         # (B, N) f32
 
-        scores_parts = []   # har timestamp uchun (B_i, E) float32
-        objs_parts   = []
-
-        for i, t_val in enumerate(unique_t):
-            mask   = t_inv == i                                         # (B,) bool
-            t_n_i  = t_val.float() / float(self.num_times)
-            t_exp  = t_n_i.unsqueeze(0).expand(E)                      # (E,)
-            e_emb  = self.de_emb(all_ids, t_exp)                       # (E, D)
-            s_i    = (query[mask].float() @ e_emb.float().T).float()   # (B_i, E) f32 — autocast ostida matmul fp16 qaytaradi!
-            scores_parts.append(s_i)
-            objs_parts.append(objects[mask])
-
-        all_scores = torch.cat(scores_parts, dim=0)                    # (B, E) f32
-        all_objs   = torch.cat(objs_parts,   dim=0)                    # (B,)
-
-        # Cross-entropy with label smoothing (1-N)
+        # 1-N cross-entropy
         link_loss = F.cross_entropy(
-            all_scores, all_objs,
+            scores, objects,
             label_smoothing=self.label_smoothing,
         )
 
-        pos_score = all_scores[torch.arange(B, device=device), all_objs]
+        # Orthogonal regularizer on query embeddings (DaeMon da ham bor)
+        Q     = self.query_emb.weight.float()
+        QTQ   = Q @ Q.T
+        ortho = torch.norm(
+            QTQ - torch.eye(Q.size(0), device=device), p="fro"
+        )
 
         losses = {
-            "link":      link_loss,
-            "self_adv":  query.new_tensor(0.0),   # 1-N da kerak emas
-            "pcl":       query.new_tensor(0.0),
-            "ortho_reg": query.new_tensor(0.0),
+            "link":     link_loss,
+            "self_adv": link_loss.new_tensor(0.0),
+            "ortho":    ortho,
         }
-        return pos_score, losses
+        return scores, losses
 
-    # ── Predict (evaluation) ──────────────────────────────────────────────────
+    # ── Predict (evaluation) ─────────────────────────────────────────────────
 
     @torch.no_grad()
     def predict(
         self,
-        subjects:   torch.Tensor,
-        relations:  torch.Tensor,
-        times:      torch.Tensor,
-        paths:      torch.Tensor,
-        path_masks: torch.Tensor,
-        history:    Optional[torch.Tensor] = None,
-        hist_mask:  Optional[torch.Tensor] = None,
+        subjects:        torch.Tensor,
+        relations:       torch.Tensor,
+        times:           torch.Tensor,
+        snapshot_graphs: List[SnapGraph],
+        paths=None, path_masks=None, history=None, hist_mask=None,
     ) -> torch.Tensor:
+
+        device    = subjects.device
         rel_fixed = self._fix_rel(relations)
-        query     = self._build_query(
-            subjects, rel_fixed, times, paths, path_masks, history, hist_mask
-        )
-        return self._score_all(query, times)
+        query     = self.query_emb(rel_fixed).float()
+        memory    = self._compute_memory(subjects, query, snapshot_graphs, device)
+        return self._score_all(memory, query, times, device).clamp(-20.0, 20.0)
