@@ -158,8 +158,17 @@ class CHRONOSTrainer:
                 o = torch.tensor([x[2] for x in batch], dtype=torch.long, device=self.device)
                 t_ten = torch.full((len(batch),), t, dtype=torch.long, device=self.device)
 
+                # Self-adversarial negative sampling (DaeMon uslubida)
+                B_cur  = s.size(0)
+                neg_o  = torch.randint(
+                    0, self._raw.num_entities,
+                    (B_cur, self._raw.num_negative),
+                    dtype=torch.long, device=self.device,
+                )
+
                 with autocast(device_type=self.device.type, enabled=self.use_fp16):
-                    _, losses = self.model(s, r, o, t_ten, snap_graphs)
+                    _, losses = self.model(s, r, o, t_ten, snap_graphs,
+                                          neg_objects=neg_o)
                     total_loss = (
                         self.cfg.w_link * losses["link"]
                         + 0.005 * losses.get("ortho", losses["link"].new_tensor(0.0))
