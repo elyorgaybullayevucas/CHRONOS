@@ -1,23 +1,30 @@
 # models/chronos_model.py
 """
-DaeMon + 1-N Cross-Entropy
+TD-PAU: Temporally-Decayed Path Aggregation Unit
 
-DaeMon arxitekturasi aynan saqlanadi:
-  - Entity-free path memory  H ∈ R^{B × N × d}
-  - PAU: query-aware distmult message passing (scatter_add, DGL yo'q)
-  - MPS: tawaregate  H = σ(W·M) * H_init + (1 - σ(W·M)) * M_prev
-  - Score: memory[b,e] · query[b]
+DaeMon zaifligini yechadi:
+  DaeMon: K ta snapshot ketma-ket, barchasi teng ahamiyat
+           H_1 → gate → H_2 → gate → ... → H_K  (K ta PAU call)
 
-Yagona farq DaeMon dan:
-  - BCE + 64 neg  →  1-N Cross-Entropy   (barcha entity, to'liq gradient)
+  TD-PAU: barcha snapshot edgelari birlashtiriladi,
+          har edge o'z temporal decay weight oladi (1 ta PAU call):
+           w(e) = exp(−λ · δt)   δt = (t_query − t_snap) / T_max
+           λ — learnable global decay rate
 
-Nima uchun 1-N CE yaxshi:
-  - DaeMon BCE+64neg: faqat 64 negative entity gradient oladi
-  - 1-N CE: barcha N entity gradient oladi → to'liq ma'lumot
-  - RE-GCN, HGLS, TiRGN — barchasi 1-N CE bilan DaeMon dan yaxshi
+Nima yangi:
+  1. Temporal decay on messages (hech bir TKG modelida yo'q)
+  2. Single-pass multi-snapshot PAU (DaeMon K call → biz 1 call)
+  3. Learnable decay rate (dataset temporal pattern ga moslashadi)
+  4. 1-N Cross-Entropy (BCE+64neg dan yaxshi, proven)
+
+Nima DaeMon bilan bir xil (proven, o'zgartirmaslik):
+  - query_emb: Embedding(2R, d)
+  - PAU: distmult message passing
+  - H_init: one-hot × query
+  - Score: H[b,e] · query[b]
 """
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -28,16 +35,22 @@ SnapGraph = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAU Layer  — DaeMon dan aynan
+# TD-PAU Layer
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PAULayer(nn.Module):
     """
-    Path Aggregation Unit (DaeMon, Dong et al. 2023).
+    Path Aggregation Unit + Temporal Decay support.
 
-    msg(j→i) = H[j] ⊙ (W_q·query ⊙ w_rel[e])  +  H_init[j]
-    agg(i)   = mean scatter_add  (non-in-place — gradient safe)
-    H_new(i) = LN(ReLU(Linear(cat(H[i], agg(i)))))
+    Standard PAU (DaeMon):
+      msg(j→i) = H[j] ⊙ (W_q·q ⊙ w_rel)  +  H_init[j]
+
+    TD-PAU (ours):
+      msg(j→i) = w(e) · (H[j] ⊙ (W_q·q ⊙ w_rel)  +  H_init[j])
+      w(e) = temporal decay weight for edge e
+
+    Aggregation: weighted mean scatter_add (non-in-place, gradient safe)
+    Update:      LN(ReLU(Linear(cat(H, agg))))
     """
 
     def __init__(self, dim: int, num_rels: int, dropout: float = 0.1):
@@ -55,13 +68,14 @@ class PAULayer(nn.Module):
 
     def forward(
         self,
-        H:      torch.Tensor,   # (B, N, d)
-        H_init: torch.Tensor,   # (B, N, d)
-        query:  torch.Tensor,   # (B, d)
-        src:    torch.Tensor,   # (E,)
-        rel:    torch.Tensor,   # (E,)
-        dst:    torch.Tensor,   # (E,)
-        N:      int,
+        H:             torch.Tensor,            # (B, N, d)
+        H_init:        torch.Tensor,            # (B, N, d)
+        query:         torch.Tensor,            # (B, d)
+        src:           torch.Tensor,            # (E,)
+        rel:           torch.Tensor,            # (E,)
+        dst:           torch.Tensor,            # (E,)
+        N:             int,
+        edge_weights:  Optional[torch.Tensor] = None,   # (E,) float
     ) -> torch.Tensor:
 
         B, _, d = H.shape
@@ -75,22 +89,32 @@ class PAULayer(nn.Module):
             )))
 
         rel    = rel.clamp(0, self.num_rels - 1)
-        w_rel  = self.rel_emb(rel).float()                       # (E, d)
-        w_q    = self.query_proj(query).float()                  # (B, d)
+        w_rel  = self.rel_emb(rel).float()                        # (E, d)
+        w_q    = self.query_proj(query).float()                   # (B, d)
 
-        src_h  = H[:, src, :].float()                            # (B, E, d)
-        init_s = H_init[:, src, :].float()                       # (B, E, d)
-        w_comb = w_q.unsqueeze(1) * w_rel.unsqueeze(0)          # (B, E, d)
-        msg    = src_h * w_comb + init_s                         # (B, E, d)
+        # Distmult message
+        src_h  = H[:, src, :].float()                             # (B, E, d)
+        init_s = H_init[:, src, :].float()                        # (B, E, d)
+        w_comb = w_q.unsqueeze(1) * w_rel.unsqueeze(0)           # (B, E, d)
+        msg    = src_h * w_comb + init_s                          # (B, E, d)
 
+        # Temporal decay weighting
+        if edge_weights is not None:
+            w = edge_weights.float().view(1, E, 1)                # (1, E, 1)
+            msg = msg * w                                         # (B, E, d)
+
+        # Non-in-place scatter_add (gradient safe)
         dst_exp = dst.view(1, E, 1).expand(B, E, d)
         agg_sum = torch.zeros(B, N, d, device=device, dtype=torch.float32)
         agg_sum = agg_sum.scatter_add(1, dst_exp, msg)
 
+        # Weighted degree normalization
         with torch.no_grad():
+            w_deg = edge_weights.float() if edge_weights is not None \
+                    else torch.ones(E, device=device)
             deg = torch.zeros(N, device=device, dtype=torch.float32)
-            deg.scatter_add_(0, dst, torch.ones(E, device=device))
-            deg = deg.clamp(min=1.0).view(1, N, 1)
+            deg.scatter_add_(0, dst, w_deg)
+            deg = deg.clamp(min=1e-6).view(1, N, 1)
 
         agg = agg_sum / deg
         return self.norm(self.drop(F.relu(
@@ -103,7 +127,16 @@ class PAULayer(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CHRONOSModel(nn.Module):
-    """DaeMon arxitekturasi + 1-N Cross-Entropy."""
+    """
+    TD-PAU model: DaeMon + temporal decay weights + 1-N CE.
+
+    Asosiy farq:
+      DaeMon: for snap in snapshots: H = PAU(gate(H, H_init), snap)  ← K calls
+      TD-PAU: H = PAU(H_init, combined_edges_with_decay)             ← 1 call
+
+    Har edge ning ta'siri: w = exp(−λ · δt)
+    λ = learnable (optimal decay rate auto-tuned per dataset)
+    """
 
     def __init__(
         self,
@@ -122,6 +155,7 @@ class CHRONOSModel(nn.Module):
         **kwargs,
     ):
         super().__init__()
+
         self.num_entities       = num_entities
         self.num_base_relations = num_relations
         self.total_relations    = num_relations * 2
@@ -133,20 +167,21 @@ class CHRONOSModel(nn.Module):
         d = entity_dim
         R = self.total_relations
 
-        # Query embedding
+        # Query embedding (DaeMon)
         self.query_emb = nn.Embedding(R, d)
         nn.init.xavier_uniform_(self.query_emb.weight)
 
-        # PAU layers
+        # TD-PAU layers
         self.pau_layers = nn.ModuleList([
             PAULayer(dim=d, num_rels=R, dropout=dropout)
             for _ in range(num_pau_layers)
         ])
 
-        # DaeMon tawaregate: σ(W · memory)
-        self.gate_weight = nn.Linear(d, d)
-        nn.init.xavier_uniform_(self.gate_weight.weight)
-        nn.init.zeros_(self.gate_weight.bias)
+        # Learnable temporal decay rate
+        # exp(-softplus(λ) · δt)
+        # softplus ensures λ > 0
+        # init = 1.0 → moderate decay: exp(-1·0.5) ≈ 0.61 at mid-range
+        self.decay_rate = nn.Parameter(torch.tensor(1.0))
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -157,24 +192,24 @@ class CHRONOSModel(nn.Module):
         self,
         subjects:        torch.Tensor,       # (B,)
         query:           torch.Tensor,        # (B, d)
+        t_query:         float,               # query timestamp (scalar)
         snapshot_graphs: List[SnapGraph],
         device:          torch.device,
     ) -> torch.Tensor:                        # (B, N, d)
         """
-        DaeMon Memory Passing Strategy (tawaregate).
+        TD-PAU forward pass.
 
-        H_init[b, subjects[b], :] = query[b]   (one-hot × query)
-        For each snapshot:
-            gate = σ(W · memory)
-            H    = gate * H_init + (1-gate) * memory
-            H    = PAU(H, H_init, query, snapshot)
-            memory = H
+        1. Barcha K snapshot edgelari birlashtiriladi
+        2. Har edge: w(e) = exp(−λ · δt)  δt ∈ [0,1]
+        3. Bitta PAU call — weighted mean aggregation
         """
         B = subjects.size(0)
         N = self.num_entities
         d = self.entity_dim
+        T = float(max(self.num_times, 1))
 
         # H_init: differentiable one-hot × query
+        # H_init[b, subjects[b], :] = query[b, :]
         one_hot = torch.zeros(B, N, device=device, dtype=torch.float32)
         one_hot.scatter_(1, subjects.unsqueeze(1).long(), 1.0)
         H_init = one_hot.unsqueeze(-1) * query.float().unsqueeze(1)  # (B, N, d)
@@ -182,29 +217,51 @@ class CHRONOSModel(nn.Module):
         if not snapshot_graphs:
             return H_init
 
-        memory   = H_init.clone()
-        is_first = True
+        # Learnable decay rate (always positive)
+        λ = F.softplus(self.decay_rate)                              # scalar > 0
 
-        for snap_src, snap_rel, snap_dst, _ in snapshot_graphs:
+        # Combine all snapshot edges with decay weights
+        all_src, all_rel, all_dst, all_w = [], [], [], []
+
+        for snap_src, snap_rel, snap_dst, snap_t in snapshot_graphs:
             snap_src = snap_src.to(device)
             snap_rel = snap_rel.to(device)
             snap_dst = snap_dst.to(device)
 
-            if is_first:
-                H        = H_init.clone()
-                is_first = False
-            else:
-                # DaeMon tawaregate
-                gate = torch.sigmoid(self.gate_weight(memory.float()))
-                H    = gate * H_init + (1.0 - gate) * memory
+            E_k = snap_src.size(0)
+            if E_k == 0:
+                continue
 
-            q_f32 = query.float()
-            for layer in self.pau_layers:
-                H = layer(H, H_init, q_f32, snap_src, snap_rel, snap_dst, N)
+            # Temporal distance: δt ∈ [0, 1]
+            delta = max((t_query - float(snap_t)) / T, 0.0)
 
-            memory = H
+            # Decay weight — differentiable through λ
+            w_k = torch.exp(-λ * delta)                              # scalar
+            w_vec = w_k.expand(E_k)                                  # (E_k,)
 
-        return memory    # (B, N, d)
+            all_src.append(snap_src)
+            all_rel.append(snap_rel)
+            all_dst.append(snap_dst)
+            all_w.append(w_vec)
+
+        if not all_src:
+            return H_init
+
+        # Combined edge list
+        combined_src = torch.cat(all_src)                            # (E_total,)
+        combined_rel = torch.cat(all_rel)
+        combined_dst = torch.cat(all_dst)
+        combined_w   = torch.cat(all_w)                              # (E_total,)
+
+        # Single-pass TD-PAU
+        H = H_init.clone()
+        q_f32 = query.float()
+        for layer in self.pau_layers:
+            H = layer(H, H_init, q_f32,
+                      combined_src, combined_rel, combined_dst,
+                      N, combined_w)
+
+        return H    # (B, N, d)
 
     def _score_all(
         self,
@@ -229,8 +286,9 @@ class CHRONOSModel(nn.Module):
         device    = subjects.device
         rel_fixed = self._fix_rel(relations)
         query     = self.query_emb(rel_fixed).float()
+        t_query   = float(times[0].item())
 
-        memory = self._compute_memory(subjects, query, snapshot_graphs, device)
+        memory = self._compute_memory(subjects, query, t_query, snapshot_graphs, device)
         scores = self._score_all(memory, query)
 
         link_loss = F.cross_entropy(
@@ -258,5 +316,6 @@ class CHRONOSModel(nn.Module):
         device    = subjects.device
         rel_fixed = self._fix_rel(relations)
         query     = self.query_emb(rel_fixed).float()
-        memory    = self._compute_memory(subjects, query, snapshot_graphs, device)
+        t_query   = float(times[0].item())
+        memory    = self._compute_memory(subjects, query, t_query, snapshot_graphs, device)
         return self._score_all(memory, query).clamp(-30.0, 30.0)
