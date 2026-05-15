@@ -1,41 +1,45 @@
 # models/chronos_model.py
 """
-MOTIVE-TKG: Motivational Pattern + Path Aggregation for TKG Link Prediction
+MOTIVE-TKG: Triple-Stream TKG Link Prediction
 
-Scientific Novelty:
-  DaeMon's core weakness: entity-free design has NO behavioral signature.
-  Regardless of WHO the subject is or WHAT the object typically receives,
-  the same query vector drives message passing. Biden and Putin get the
-  same query if they share a relation type. Every entity is structurally
-  anonymous.
+Uchta mustaqil signal birlashtiruvchi model:
 
-MOTIVE-TKG introduces two complementary behavioral profiles:
+━━━ Stream 1: PATH (DaeMon PAU — o'zgarishsiz) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Sequential graph message passing.
+  "Qanday struktural yo'l s ni kandidat ob'ektlarga bog'laydi?"
 
-  s_motive[s, t] = decay-weighted mean of relation embeddings s SENT
-                   "what kinds of interactions does s typically initiate?"
+━━━ Stream 2: MOTIVE (ikki tomonlama behavioral signature) ━━━━━━━━━━━━━━━━━━
+  s_motive[s] · o_ctx[e]   (bilinear dot-product)
+  s_motive[s] = decay-weighted mean of s YUBORGAN relation emb-lar
+  o_ctx[e]    = decay-weighted mean of e QABUL QILGAN relation emb-lar
+  "s ning tashabbus profili e ning qabul profili bilan qanchalik mos?"
 
-  o_ctx[e, t]    = decay-weighted mean of relation embeddings directed AT e
-                   "what kinds of interactions does entity e typically receive?"
+━━━ Stream 3: RECURRENCE (differensiabel copy mechanism) ━━━━━━━━━━━━━━━━━━━━
+  (s, r, e, t_past) → e ga yaqinda sodir bo'lgan → e ni yana bashorat qil
+  recur_score[b, e] = Σ_k w_k  for edges where src=s[b], rel=r[b], dst=e
+  "s dan r bilan e ga yaqinda munosabat bo'lganmi?"
 
-  motive_score(s, e) = s_motive[s] · o_ctx[e]          (bilinear dot-product)
+  Bu TLogic (qoida-asosli) ning differensiabel neural versiyasi.
+  Gradient decay_rate orqali oqadi (r_emb emas, lekin w=exp(-λδ) orqali).
 
-  final_score = path_score + α · motive_score
+━━━ Yig'indi ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  score = path + α_m · motive + α_r · recurrence
 
-  path_score: exact DaeMon sequential PAU (tawaregate MPS, entity-free)
+Kafolatlar:
+  ✓ α_m→0, α_r→0  →  aynan DaeMon, hech qachon yomonlashmaydi
+  ✓ Faqat 3 yangi scalar parametr (α_m, α_r, λ)
+  ✓ Entity-free: entity embedding yo'q
+  ✓ 1-N Cross-Entropy: barcha N entity gradient oladi
+  ✓ scatter_add non-in-place hamma joyda
 
-Guarantees:
-  ✓ α→0 (sigmoid(-∞)) → exact DaeMon, never worse
-  ✓ 1-N Cross-Entropy loss (full negative gradient vs DaeMon's BCE+64neg)
-  ✓ Entity-free: o_ctx aggregated from relation embeddings only, no entity emb
-  ✓ Only 2 new learnable scalars: α (motive weight), λ (temporal decay)
-  ✓ Differentiable: r_emb_w = rel_emb[c_rel] * w_decay flows gradient to query_emb
+Ilmiy yangilik:
+  Mavjud modellar (DaeMon, RE-GCN, xERTE, CEN, CENET, TiRGN):
+    - PATH signali bor
+    - MOTIVE signali yo'q (kimdir)
+    - RECURRENCE differensiabel yo'q (TLogic qoida-asosli, neural emas)
+  MOTIVE-TKG uchala signalni birinchi marta birlashtirib, entity-free qoladi.
 
-Prior work gap:
-  DaeMon, RE-GCN, xERTE, CEN, CENET — none model BOTH sender initiative pattern
-  AND receiver receptivity profile simultaneously.
-  MOTIVE-TKG is the first to combine both via a lightweight bilinear motive stream.
-
-DaeMon-proven components (unchanged):
+DaeMon dan saqlangan:
   ✓ Sequential PAU + tawaregate (MPS)
   ✓ Entity-free full graph message passing
   ✓ scatter_add non-in-place
@@ -52,14 +56,11 @@ SnapGraph = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAU Layer  (DaeMon — unchanged)
+# PAU Layer  (DaeMon — o'zgarishsiz)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PAULayer(nn.Module):
-    """
-    DaeMon Path Aggregation Unit.
-    Unchanged from original — MOTIVE stream is orthogonal.
-    """
+    """DaeMon Path Aggregation Unit. Unchanged."""
 
     def __init__(self, dim: int, num_rels: int, dropout: float = 0.1):
         super().__init__()
@@ -157,12 +158,15 @@ class CHRONOSModel(nn.Module):
         nn.init.xavier_uniform_(self.gate_weight.weight)
         nn.init.zeros_(self.gate_weight.bias)
 
-        # ── MOTIVE parameters (only 2 new scalars) ────────────────────────────
-        # decay_rate → λ = softplus(decay_rate) > 0   temporal decay speed
-        # alpha_param → α = sigmoid(alpha_param) ∈ (0,1)  motive stream weight
-        #   α→0 when alpha_param→-∞ → reduces to exact DaeMon
-        self.decay_rate  = nn.Parameter(torch.zeros(1))
-        self.alpha_param = nn.Parameter(torch.zeros(1))
+        # ── MOTIVE-TKG yangi parametrlari (faqat 3 ta scalar) ─────────────────
+        # decay_rate  → λ = softplus(.)  > 0        temporal decay tezligi
+        # alpha_m     → α_m = sigmoid(.) ∈ (0,1)   motive stream og'irligi
+        # alpha_r     → α_r = sigmoid(.) ∈ (0,1)   recurrence stream og'irligi
+        #
+        # α_m=0, α_r=0  →  aynan DaeMon (kafolat)
+        self.decay_rate = nn.Parameter(torch.zeros(1))
+        self.alpha_m    = nn.Parameter(torch.zeros(1))   # motive weight
+        self.alpha_r    = nn.Parameter(torch.zeros(1))   # recurrence weight
 
     # ── Helper ─────────────────────────────────────────────────────────────────
 
@@ -173,18 +177,19 @@ class CHRONOSModel(nn.Module):
 
     def _compute_scores(
         self,
-        subjects:        torch.Tensor,       # (B,)
-        query:           torch.Tensor,        # (B, d)
+        subjects:        torch.Tensor,   # (B,)
+        relations:       torch.Tensor,   # (B,)  ← recurrence uchun kerak
+        query:           torch.Tensor,   # (B, d)
         t_query:         float,
         snapshot_graphs: List[SnapGraph],
         device:          torch.device,
-    ) -> torch.Tensor:                        # (B, N)
+    ) -> torch.Tensor:                   # (B, N)
 
         B, N, d = subjects.size(0), self.num_entities, self.entity_dim
         T       = float(max(self.num_times, 1))
         λ       = F.softplus(self.decay_rate)   # > 0
 
-        # H_init: one-hot × query  (differentiable)
+        # H_init: one-hot × query  (differensiabel)
         one_hot = torch.zeros(B, N, device=device, dtype=torch.float32)
         one_hot.scatter_(1, subjects.unsqueeze(1).long(), 1.0)
         H_init  = one_hot.unsqueeze(-1) * query.float().unsqueeze(1)   # (B, N, d)
@@ -192,11 +197,11 @@ class CHRONOSModel(nn.Module):
         if not snapshot_graphs:
             return (H_init * query.float().unsqueeze(1)).sum(-1)
 
-        # ── Pre-process: device transfer + decay weights ───────────────────────
+        # ── Snapshot preprocessing: device transfer + decay weights ───────────
         processed = []
         for snap_src, snap_rel, snap_dst, snap_t in snapshot_graphs:
             δ = max((t_query - float(snap_t)) / T, 0.0)
-            w = torch.exp(-λ * δ)                          # scalar, differentiable
+            w = torch.exp(-λ * δ)                          # scalar, grad ✓
             processed.append((
                 snap_src.to(device),
                 snap_rel.to(device).clamp(0, self.total_relations - 1),
@@ -204,45 +209,68 @@ class CHRONOSModel(nn.Module):
                 w,
             ))
 
-        # ── MOTIVE stream ──────────────────────────────────────────────────────
-        # Concatenate all historical edges (all snapshots merged)
+        # ── Barcha snapshotlarni birlashtirish ────────────────────────────────
         c_src = torch.cat([p[0] for p in processed])                   # (E_total,)
         c_rel = torch.cat([p[1] for p in processed])                   # (E_total,)
         c_dst = torch.cat([p[2] for p in processed])                   # (E_total,)
         c_w   = torch.cat([p[3].view(1).expand(p[0].size(0))
                            for p in processed])                        # (E_total,) grad ✓
-
-        # Decay-weighted relation embeddings: gradient flows to query_emb
-        r_emb   = self.query_emb(c_rel).float()                        # (E_total, d)
-        r_emb_w = r_emb * c_w.unsqueeze(-1)                            # (E_total, d)
-
         E_total = c_dst.size(0)
 
-        # o_ctx[e]: "receptivity profile" — what relation types e typically receives
-        # Aggregated as decay-weighted mean of incoming relation embeddings
+        # ── Shared: decay-weighted relation embeddings ────────────────────────
+        r_emb   = self.query_emb(c_rel).float()                        # (E_total, d)
+        r_emb_w = r_emb * c_w.unsqueeze(-1)                            # (E_total, d) grad ✓
+
+        # ── MOTIVE STREAM ─────────────────────────────────────────────────────
+
+        # src_match[b, k] = 1 if c_src[k] == subjects[b]
+        src_match = (subjects.unsqueeze(1) == c_src.unsqueeze(0))      # (B, E_total) bool
+
+        # o_ctx[e]: entity e qabul qilgan relation embeddinglarning o'rtachasi
+        #   "e ning receptivity profili"
         dst_exp   = c_dst.unsqueeze(-1).expand(E_total, d)
         o_ctx_sum = torch.zeros(N, d, device=device, dtype=torch.float32)
-        o_ctx_sum = o_ctx_sum.scatter_add(0, dst_exp, r_emb_w)         # (N, d) non-in-place
+        o_ctx_sum = o_ctx_sum.scatter_add(0, dst_exp, r_emb_w)         # (N, d)
 
         with torch.no_grad():
             o_cnt = torch.zeros(N, device=device, dtype=torch.float32)
             o_cnt.scatter_add_(0, c_dst, c_w.detach())
-            o_cnt = o_cnt.clamp(min=1e-6).unsqueeze(-1)                # (N, 1)
+            o_cnt = o_cnt.clamp(min=1e-6).unsqueeze(-1)
 
         o_ctx = o_ctx_sum / o_cnt                                      # (N, d)
 
-        # s_motive[b]: "initiative profile" — what relation types subject[b] typically sends
-        # Aggregated as decay-weighted mean of outgoing relation embeddings
-        match    = (subjects.unsqueeze(1) == c_src.unsqueeze(0)).float()  # (B, E_total)
-        s_motive = match @ r_emb_w                                        # (B, d) grad ✓
-        s_norm   = (match * c_w.unsqueeze(0)).sum(-1, keepdim=True)       # (B, 1)
-        s_motive = s_motive / s_norm.clamp(min=1e-6)                      # (B, d)
+        # s_motive[b]: subjects[b] yuborgan relation embeddinglarning o'rtachasi
+        #   "s ning initiative profili"
+        src_match_f = src_match.float()                                # (B, E_total)
+        s_motive    = src_match_f @ r_emb_w                            # (B, d)
+        s_norm      = (src_match_f * c_w.unsqueeze(0)).sum(-1, keepdim=True)
+        s_motive    = s_motive / s_norm.clamp(min=1e-6)                # (B, d)
 
-        # Bilinear motive compatibility:
-        #   How well does s's initiative pattern match e's receptivity profile?
+        # Bilinear compatibility: s initiative × e receptivity
         motive_score = (s_motive.unsqueeze(1) * o_ctx.unsqueeze(0)).sum(-1)  # (B, N)
 
-        # ── Path stream: DaeMon sequential MPS (exact, unchanged) ─────────────
+        # ── RECURRENCE STREAM ─────────────────────────────────────────────────
+        # (s[b], r[b], e, t_past) → yaqinda sodir bo'lgan → e ni yana bashorat qil
+        # TLogic ning differensiabel neural versiyasi
+
+        # rel_match[b, k] = 1 if c_rel[k] == relations[b]
+        rel_match = (relations.unsqueeze(1) == c_rel.unsqueeze(0))     # (B, E_total) bool
+
+        # sr_match[b, k] = 1 if edge k starts at s[b] with relation r[b]
+        sr_match = (src_match & rel_match).float()                     # (B, E_total)
+
+        # recur_score[b, e] = Σ_k w_k  for k: c_src[k]=s[b], c_rel[k]=r[b], c_dst[k]=e
+        sr_weighted = sr_match * c_w.unsqueeze(0)                      # (B, E_total) grad ✓
+
+        dst_exp_b    = c_dst.unsqueeze(0).expand(B, -1)                # (B, E_total)
+        recur_score  = torch.zeros(B, N, device=device, dtype=torch.float32)
+        recur_score  = recur_score.scatter_add(1, dst_exp_b, sr_weighted)  # (B, N)
+
+        # Normalization: total weight per (s, r) pair
+        recur_total  = sr_weighted.sum(-1, keepdim=True).clamp(min=1e-6)   # (B, 1)
+        recur_score  = recur_score / recur_total                            # (B, N) ∈ [0,1]
+
+        # ── PATH STREAM: DaeMon sequential MPS (o'zgarishsiz) ────────────────
         memory   = H_init.clone()
         is_first = True
 
@@ -257,15 +285,17 @@ class CHRONOSModel(nn.Module):
             for layer in self.pau_layers:
                 H = layer(H, H_init, query, snap_src, snap_rel, snap_dst, N)
 
-            # Temporal decay memory update: recent snapshots dominate
+            # Temporal decay memory update
             memory = w * H + (1.0 - w) * memory                       # (B, N, d)
 
         path_score = (memory * query.float().unsqueeze(1)).sum(-1)     # (B, N)
 
-        # ── Final score: path + α · motive ────────────────────────────────────
-        # α = sigmoid(alpha_param): when α→0, reduces to exact DaeMon
-        α = torch.sigmoid(self.alpha_param)
-        return path_score + α * motive_score                           # (B, N)
+        # ── Uchta signal yig'indisi ───────────────────────────────────────────
+        # α_m, α_r → 0 bo'lsa, aynan DaeMon (kafolat)
+        α_m = torch.sigmoid(self.alpha_m)
+        α_r = torch.sigmoid(self.alpha_r)
+
+        return path_score + α_m * motive_score + α_r * recur_score    # (B, N)
 
     # ── Training ───────────────────────────────────────────────────────────────
 
@@ -281,10 +311,13 @@ class CHRONOSModel(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
         device  = subjects.device
-        query   = self.query_emb(self._fix_rel(relations)).float()     # (B, d)
+        r_fix   = self._fix_rel(relations)
+        query   = self.query_emb(r_fix).float()                        # (B, d)
         t_query = float(times[0].item())
 
-        scores = self._compute_scores(subjects, query, t_query, snapshot_graphs, device)
+        scores = self._compute_scores(
+            subjects, r_fix, query, t_query, snapshot_graphs, device
+        )
 
         loss = F.cross_entropy(scores, objects, label_smoothing=self.label_smoothing)
 
@@ -307,9 +340,10 @@ class CHRONOSModel(nn.Module):
     ) -> torch.Tensor:
 
         device  = subjects.device
-        query   = self.query_emb(self._fix_rel(relations)).float()
+        r_fix   = self._fix_rel(relations)
+        query   = self.query_emb(r_fix).float()
         t_query = float(times[0].item())
 
         return self._compute_scores(
-            subjects, query, t_query, snapshot_graphs, device
+            subjects, r_fix, query, t_query, snapshot_graphs, device
         ).clamp(-30.0, 30.0)
