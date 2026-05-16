@@ -100,12 +100,12 @@ def _preset(cfg: Config, logger) -> None:
 
     elif cfg.dataset in ("YAGO", "YAGOs"):
         cfg.max_history    = 10
-        cfg.batch_size     = 32
+        cfg.batch_size     = 64   # DaeMon: batch_size=64 for YAGO
         cfg.num_epochs     = 50
         cfg.learning_rate  = 5e-4
         cfg.use_reciprocal = True
         cfg.eval_every     = 2
-        logger.info(f"{cfg.dataset} preset: epochs=50, history=10")
+        logger.info(f"{cfg.dataset} preset: epochs=50, history=10, batch=64")
 
     elif cfg.dataset == "ICEWS18":
         cfg.max_history    = 25
