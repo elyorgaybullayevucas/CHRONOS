@@ -13,9 +13,9 @@ class Config:
     num_times:     int = 0
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    entity_dim:   int   = 256
-    relation_dim: int   = 256
-    hidden_dim:   int   = 512
+    entity_dim:   int   = 64     # argparse default bilan mos (64)
+    relation_dim: int   = 64
+    hidden_dim:   int   = 256
     delta_dim:    int   = 64
     dropout:      float = 0.1
 
@@ -30,10 +30,10 @@ class Config:
     use_reciprocal: bool = True
 
     # ── Training ──────────────────────────────────────────────────────────────
-    num_epochs:      int   = 50
-    batch_size:      int   = 512
-    learning_rate:   float = 3e-4
-    weight_decay:    float = 1e-4
+    num_epochs:      int   = 30    # argparse default bilan mos (30)
+    batch_size:      int   = 32    # argparse default bilan mos (32)
+    learning_rate:   float = 5e-4  # argparse default bilan mos (5e-4)
+    weight_decay:    float = 1e-5  # argparse default bilan mos (1e-5)
     grad_clip:       float = 1.0
     label_smoothing: float = 0.1
 
