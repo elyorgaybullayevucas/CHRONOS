@@ -1,31 +1,33 @@
 # models/chronos_model.py
 """
-TemporalGate-TKG: Sequential PAU + Full PNA + Temporal Decay Gating + Recurrence
+TAPAU — Temporal Attention PAU
 
-DaeMon muammosi (TiPNN 2024 da isbotlangan):
-  Sequential MPS: t1 → t2 → ... → tK — barcha snapshotlar teng og'irlikda.
-  Eski snapshot ma'lumoti yangi bilan overwrite qilinadi.
+DaeMon (sequential):   H0 → PAU(snap1) → H1 → PAU(snap2) → H2 → ... → HK
+                       Muammo: eski snapshots keyingilarga "erib" ketadi.
 
-TemporalGate-TKG yechimi:
-  1. Full PNA aggregation: mean + max + min + std (4 aggregator, d=64 → update: 5d)
-     DaeMon faqat mean+max ishlatadi — biz +min+std qo'shamiz.
+TAPAU (independent + attention):
+  Qadam 1 — Har bir snapshot MUSTAQIL ishlaydi:
+             H_k = PAU_layers(H_init, snap_k)  [H_init dan boshlab]
+  Qadam 2 — Entity-level temporal self-attention:
+             score(n, k) = (H_k[n] · attn_query) / sqrt(d) + temporal_bias_k
+             weight(n, k) = softmax_k(score(n, k))
+             H_final[n]   = Σ_k weight(n,k) * H_k[n]
+  Qadam 3 — Link score = H_final · query + α * recurrence
 
-  2. Temporal decay gating (yangi contribution):
-     H = H + decay_k * (H_new - H)
-     decay_k = exp(-λ * (t_query - t_k) / T)
-     λ — learnable. Yangi snapshot kuchli ta'sir, eski snapshot kuchsiz.
-     DaeMon: barcha snapshot teng. Biz: recency-aware weighted update.
+Nima uchun DaeMon dan yaxshi?
+  1. Har bir snapshot TOZA signal beradi (boshqalar bilan aralashmagan)
+  2. Entity-specific attention: har bir entity o'zi uchun eng muhim
+     snapshotni tanlaydi — DaeMon da barcha entity uchun bir xil sek.
+  3. Query-conditioned: turli query'lar turli snapshotlarga e'tibor beradi
+  4. Temporal bias: recency inductive bias + content-based override
 
-  3. Recurrence stream (TLogic insight):
-     recur[b,e] = Σ_k w_k * I[src_k=s_b, rel_k=r_b, dst_k=e]
-     Decay-weighted pattern matching.
+Nima uchun decay gating dan yaxshi?
+  Decay gating: snapshot uchun SCALAR og'irlik (barcha entity uchun bir xil)
+  TAPAU:        (B, N, K) attention matrix — har entity × snapshot juftligi uchun alohida
 
-  4. Sequential processing (unified graph emas):
-     YAGO temporal path chaining uchun zarur — unified graph bu chainni buzadi.
-
-Loss: BCE + 64 self-adversarial negatives (DaeMon protocol)
-Ortho reg: ||W·Wᵀ - I||₂ on query embeddings (separate from link loss)
+Loss: BCE + 64 self-adversarial (DaeMon protocol)
 """
+import math
 from typing import Dict, List, Tuple
 
 import torch
@@ -37,10 +39,9 @@ SnapGraph = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]
 
 class PAULayer(nn.Module):
     """
-    PAU with mean + max aggregation (PNA-lite).
-    Update: [H, mean, max] → d  (3d input → d output)
-    Residual + LayerNorm + Dropout.
-    min/std removed: (B, N, 5d) inp OOM bo'ladi YAGO da (B=64, N=10623).
+    PAU: mean + max aggregation.
+    msg = H[src] * (query_proj(q) * rel_emb[r]) + H_init[src]
+    update: [H, mean, max] → d   (3d → d, ReLU + LayerNorm + Residual)
     """
 
     def __init__(self, dim: int, num_rels: int, dropout: float = 0.1):
@@ -48,19 +49,12 @@ class PAULayer(nn.Module):
         self.num_rels   = num_rels
         self.rel_emb    = nn.Embedding(num_rels + 1, dim, padding_idx=num_rels)
         self.query_proj = nn.Linear(dim, dim, bias=False)
-        self.update     = nn.Linear(dim * 3, dim)   # H + mean + max → d
+        self.update     = nn.Linear(dim * 3, dim)
         self.norm       = nn.LayerNorm(dim)
         self.drop       = nn.Dropout(dropout)
         nn.init.xavier_uniform_(self.rel_emb.weight[:-1])
 
     def forward(self, H, H_init, query, src, rel, dst, N):
-        """
-        H:      (B, N, d)
-        H_init: (B, N, d) — initial representation (one-hot × query)
-        query:  (B, d)
-        src, rel, dst: (E,)
-        N: num entities
-        """
         B, _, d = H.shape
         E       = src.size(0)
         device  = H.device
@@ -72,26 +66,26 @@ class PAULayer(nn.Module):
             ))))
             return out + H.float()
 
-        rel   = rel.clamp(0, self.num_rels - 1)
-        w_rel = self.rel_emb(rel).float()                  # (E, d)
-        w_q   = self.query_proj(query).float()             # (B, d)
+        rel    = rel.clamp(0, self.num_rels - 1)
+        w_rel  = self.rel_emb(rel).float()                  # (E, d)
+        w_q    = self.query_proj(query).float()             # (B, d)
 
-        src_h  = H[:, src, :].float()                      # (B, E, d)
-        init_s = H_init[:, src, :].float()                 # (B, E, d)
-        msg    = src_h * (w_q.unsqueeze(1) * w_rel.unsqueeze(0)) + init_s  # (B, E, d)
+        src_h  = H[:, src, :].float()                       # (B, E, d)
+        init_s = H_init[:, src, :].float()                  # (B, E, d)
+        msg    = src_h * (w_q.unsqueeze(1) * w_rel.unsqueeze(0)) + init_s
 
         dst_exp = dst.view(1, E, 1).expand(B, E, d)
 
-        # ── Mean aggregation ──────────────────────────────────────────────────
+        # Mean
         agg_sum = torch.zeros(B, N, d, device=device, dtype=torch.float32)
         agg_sum = agg_sum.scatter_add(1, dst_exp, msg)
         with torch.no_grad():
             deg = torch.zeros(N, device=device, dtype=torch.float32)
             deg.scatter_add_(0, dst, torch.ones(E, device=device))
             deg = deg.clamp(min=1.0).view(1, N, 1)
-        agg_mean = agg_sum / deg                           # (B, N, d)
+        agg_mean = agg_sum / deg
 
-        # ── Max aggregation ───────────────────────────────────────────────────
+        # Max
         agg_max = torch.full((B, N, d), float('-inf'), device=device, dtype=torch.float32)
         try:
             agg_max = agg_max.scatter_reduce(1, dst_exp, msg, reduce='amax')
@@ -99,9 +93,9 @@ class PAULayer(nn.Module):
             agg_max.scatter_(1, dst_exp, msg)
         agg_max = agg_max.masked_fill(agg_max == float('-inf'), 0.0)
 
-        inp   = torch.cat([H.float(), agg_mean, agg_max], dim=-1)         # (B, N, 3d)
+        inp   = torch.cat([H.float(), agg_mean, agg_max], dim=-1)   # (B, N, 3d)
         H_new = self.norm(self.drop(F.relu(self.update(inp))))
-        return H_new + H.float()                           # residual
+        return H_new + H.float()                                      # residual
 
 
 class CHRONOSModel(nn.Module):
@@ -138,23 +132,31 @@ class CHRONOSModel(nn.Module):
         d = entity_dim
         R = num_relations * 2
 
+        # Relation query embeddings
         self.query_emb  = nn.Embedding(R, d)
-        self.pau_layers = nn.ModuleList([PAULayer(d, R, dropout)
-                                         for _ in range(num_pau_layers)])
         nn.init.xavier_uniform_(self.query_emb.weight)
 
-        # Temporal decay rate (learnable): decay_k = exp(-λ * δ_k)
-        # Initialized near 0 so model starts with mild decay, learns optimal λ
-        self.decay_rate = nn.Parameter(torch.zeros(1))
+        # PAU layers (applied per-snapshot, independently)
+        self.pau_layers = nn.ModuleList([PAULayer(d, R, dropout)
+                                         for _ in range(num_pau_layers)])
 
-        # Recurrence stream weight (sigmoid → [0,1])
+        # Temporal attention query projection:
+        # attn_q = Linear(query) used to score each entity × snapshot pair
+        self.attn_q = nn.Linear(d, d, bias=False)
+        nn.init.xavier_uniform_(self.attn_q.weight)
+
+        # Temporal bias: learnable per-snapshot recency bias weight
+        # score(n,k) += -bias_scale * delta_k  (recent=small delta → higher score)
+        self.bias_scale = nn.Parameter(torch.ones(1))
+
+        # Recurrence stream
+        self.decay_rate = nn.Parameter(torch.zeros(1))
         self.alpha_r    = nn.Parameter(torch.zeros(1))
 
     def _fix_rel(self, r):
         return r.clamp(0, self.total_relations - 1)
 
     def _ortho_reg(self):
-        """||W·Wᵀ - I||₂ — query embeddings uchun ortogonallik regulyarizatsiyasi."""
         W = self.query_emb.weight
         I = torch.eye(W.size(0), device=W.device, dtype=W.dtype)
         return torch.norm(torch.mm(W, W.t()) - I, p=2)
@@ -162,9 +164,9 @@ class CHRONOSModel(nn.Module):
     def _compute_scores(self, subjects, relations, query, t_query, snapshot_graphs, device):
         B, N, d = subjects.size(0), self.num_entities, self.entity_dim
         T = float(max(self.num_times, 1))
-        λ = F.softplus(self.decay_rate)   # positive, learnable decay rate
+        λ = F.softplus(self.decay_rate)
 
-        # H_init: one-hot(subject) × query_emb  →  entity-free initialization
+        # H_init: one-hot(subject) × query  →  entity-free initialization
         one_hot = torch.zeros(B, N, device=device, dtype=torch.float32)
         one_hot.scatter_(1, subjects.unsqueeze(1).long(), 1.0)
         H_init  = one_hot.unsqueeze(-1) * query.float().unsqueeze(1)  # (B, N, d)
@@ -172,54 +174,82 @@ class CHRONOSModel(nn.Module):
         if not snapshot_graphs:
             return (H_init * query.float().unsqueeze(1)).sum(-1)
 
-        # ── Preprocess snapshots: device transfer + compute decay weights ──────
-        # Oldest first → newest last (chronological order)
+        # ── Preprocess snapshots ──────────────────────────────────────────────
         proc = []
         for snap_src, snap_rel, snap_dst, snap_t in snapshot_graphs:
             s_ = snap_src.to(device)
             r_ = snap_rel.to(device).clamp(0, self.total_relations - 1)
             d_ = snap_dst.to(device)
             δ  = max((t_query - float(snap_t)) / T, 0.0)
-            w  = torch.exp(-λ * δ)          # scalar tensor, grad flows through λ
-            proc.append((s_, r_, d_, w))
+            w  = torch.exp(-λ * δ)   # for recurrence stream
+            proc.append((s_, r_, d_, w, δ))
 
-        # ── Sequential PAU with Temporal Decay Gating ─────────────────────────
-        # H = H + decay * (H_new - H)  ≡  (1-decay)*H + decay*H_new
-        # Recent snapshot (small δ → decay≈1): H ≈ H_new  (strong update)
-        # Old snapshot    (large δ → decay≈0): H unchanged  (weak update)
-        # Learnable λ finds the optimal recency-vs-history trade-off.
-        H = H_init.clone()
-        for s_, r_, d_, decay in proc:
-            H_new = H
+        K = len(proc)
+
+        # ── TAPAU Step 1: Independent per-snapshot PAU ────────────────────────
+        # Each snapshot k: H_k = PAU_layers(H_init, snap_k)
+        # H_init is the SAME starting point for all snapshots.
+        # → No blending between snapshots during PAU.
+        # → Each H_k is a CLEAN representation of "what PAU infers from snap_k alone."
+        H_snaps = []   # K × (B, N, d)
+        for s_, r_, d_, _, _ in proc:
+            H_k = H_init.clone()
             for layer in self.pau_layers:
-                H_new = layer(H_new, H_init, query, s_, r_, d_, N)
-            # Temporal gated update
-            H = H + decay * (H_new - H)
+                H_k = layer(H_k, H_init, query, s_, r_, d_, N)
+            H_snaps.append(H_k)      # (B, N, d)
 
-        path_score = (H * query.float().unsqueeze(1)).sum(-1)      # (B, N)
+        # ── TAPAU Step 2: Entity-level Temporal Self-Attention ────────────────
+        # attention query: linear transform of relation query
+        attn_q = self.attn_q(query.float())   # (B, d)
+
+        # score(b, n, k) = dot(H_k[b,n], attn_q[b]) / sqrt(d)
+        #                + temporal_bias_k
+        # temporal_bias_k = -bias_scale * delta_k
+        #   → recent snapshot (small δ) gets HIGHER bias → preferred by default
+        #   → content-based attention can override this bias
+        attn_logits = torch.stack(
+            [(H_k.float() * attn_q.unsqueeze(1)).sum(-1)
+             for H_k in H_snaps],
+            dim=-1
+        )  # (B, N, K)
+
+        # Add learnable temporal bias (recency inductive prior)
+        delta_tensor = torch.tensor(
+            [δ for _, _, _, _, δ in proc],
+            device=device, dtype=torch.float32
+        )  # (K,)
+        temporal_bias = -F.softplus(self.bias_scale) * delta_tensor   # (K,)
+        attn_logits = attn_logits + temporal_bias.view(1, 1, K)
+
+        attn_weights = F.softmax(attn_logits / math.sqrt(d), dim=-1)  # (B, N, K)
+
+        # Weighted aggregation: H_final = Σ_k weight(n,k) * H_k[n]
+        H_final = torch.zeros(B, N, d, device=device, dtype=torch.float32)
+        for k, H_k in enumerate(H_snaps):
+            H_final = H_final + attn_weights[:, :, k:k+1] * H_k.float()
+
+        path_score = (H_final * query.float().unsqueeze(1)).sum(-1)   # (B, N)
 
         # ── Recurrence Stream ─────────────────────────────────────────────────
-        # Decay-weighted pattern matching: (s,r,?) in history
-        c_src = torch.cat([s_              for s_, _, _, _  in proc])
-        c_rel = torch.cat([r_              for _, r_, _, _  in proc])
-        c_dst = torch.cat([d_              for _, _, d_, _  in proc])
-        c_w   = torch.cat([w.expand(s_.size(0)) for s_, _, _, w in proc])
+        c_src = torch.cat([s_ for s_, _, _, _, _ in proc])
+        c_rel = torch.cat([r_ for _, r_, _, _, _ in proc])
+        c_dst = torch.cat([d_ for _, _, d_, _, _ in proc])
+        c_w   = torch.cat([w.expand(s_.size(0)) for s_, _, _, w, _ in proc])
 
-        src_m = (subjects.unsqueeze(1) == c_src.unsqueeze(0))     # (B, E_total)
-        rel_m = (relations.unsqueeze(1) == c_rel.unsqueeze(0))    # (B, E_total)
-        sr_w  = (src_m & rel_m).float() * c_w.unsqueeze(0)       # (B, E_total)
+        src_m = (subjects.unsqueeze(1) == c_src.unsqueeze(0))
+        rel_m = (relations.unsqueeze(1) == c_rel.unsqueeze(0))
+        sr_w  = (src_m & rel_m).float() * c_w.unsqueeze(0)
 
         dst_exp    = c_dst.unsqueeze(0).expand(B, -1)
         recur      = torch.zeros(B, N, device=device, dtype=torch.float32)
         recur      = recur.scatter_add(1, dst_exp, sr_w)
         recur_norm = sr_w.sum(-1, keepdim=True).clamp(min=1e-6)
-        recur      = recur / recur_norm                            # (B, N)
+        recur      = recur / recur_norm
 
         α = torch.sigmoid(self.alpha_r)
         return path_score + α * recur
 
     def _adv_bce_loss(self, scores, objects, neg_objects):
-        """BCE + 64 self-adversarial negatives (DaeMon protocol)."""
         B   = scores.size(0)
         idx = torch.arange(B, device=scores.device)
         pos = scores[idx, objects]
@@ -242,7 +272,6 @@ class CHRONOSModel(nn.Module):
             subjects, r_fix, query, t_query, snapshot_graphs, device
         )
 
-        # Ortho reg: tracked separately from link loss (trainer combines them)
         ortho_loss = self._ortho_reg()
 
         if neg_objects is not None:
