@@ -37,9 +37,10 @@ SnapGraph = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]
 
 class PAULayer(nn.Module):
     """
-    PAU with Full PNA aggregation: mean + max + min + std.
-    Update: [H, mean, max, min, std] → d  (5d input → d output)
+    PAU with mean + max aggregation (PNA-lite).
+    Update: [H, mean, max] → d  (3d input → d output)
     Residual + LayerNorm + Dropout.
+    min/std removed: (B, N, 5d) inp OOM bo'ladi YAGO da (B=64, N=10623).
     """
 
     def __init__(self, dim: int, num_rels: int, dropout: float = 0.1):
@@ -47,7 +48,7 @@ class PAULayer(nn.Module):
         self.num_rels   = num_rels
         self.rel_emb    = nn.Embedding(num_rels + 1, dim, padding_idx=num_rels)
         self.query_proj = nn.Linear(dim, dim, bias=False)
-        self.update     = nn.Linear(dim * 5, dim)   # H + mean + max + min + std → d
+        self.update     = nn.Linear(dim * 3, dim)   # H + mean + max → d
         self.norm       = nn.LayerNorm(dim)
         self.drop       = nn.Dropout(dropout)
         nn.init.xavier_uniform_(self.rel_emb.weight[:-1])
@@ -65,7 +66,7 @@ class PAULayer(nn.Module):
         device  = H.device
 
         if E == 0:
-            agg_zero = torch.zeros(B, N, d * 4, device=device, dtype=torch.float32)
+            agg_zero = torch.zeros(B, N, d * 2, device=device, dtype=torch.float32)
             out = self.norm(self.drop(F.relu(self.update(
                 torch.cat([H.float(), agg_zero], dim=-1)
             ))))
@@ -98,21 +99,7 @@ class PAULayer(nn.Module):
             agg_max.scatter_(1, dst_exp, msg)
         agg_max = agg_max.masked_fill(agg_max == float('-inf'), 0.0)
 
-        # ── Min aggregation ───────────────────────────────────────────────────
-        agg_min = torch.full((B, N, d), float('inf'), device=device, dtype=torch.float32)
-        try:
-            agg_min = agg_min.scatter_reduce(1, dst_exp, msg, reduce='amin')
-        except (TypeError, RuntimeError):
-            agg_min.scatter_(1, dst_exp, msg)
-        agg_min = agg_min.masked_fill(agg_min == float('inf'), 0.0)
-
-        # ── Std aggregation: sqrt(E[x²] - E[x]²) ────────────────────────────
-        agg_sq  = torch.zeros(B, N, d, device=device, dtype=torch.float32)
-        agg_sq  = agg_sq.scatter_add(1, dst_exp, msg ** 2)
-        agg_sq  = agg_sq / deg                             # E[x²], (B, N, d)
-        agg_std = torch.sqrt((agg_sq - agg_mean ** 2).clamp(min=1e-8))  # (B, N, d)
-
-        inp   = torch.cat([H.float(), agg_mean, agg_max, agg_min, agg_std], dim=-1)  # (B, N, 5d)
+        inp   = torch.cat([H.float(), agg_mean, agg_max], dim=-1)         # (B, N, 3d)
         H_new = self.norm(self.drop(F.relu(self.update(inp))))
         return H_new + H.float()                           # residual
 
